@@ -1,0 +1,18 @@
+{
+  "dcs_modules": {
+    "dcs_1001h": 31,
+    "dcs_1002h": 50,
+    "dcs_1003h": 43,
+    "dcs_1004h": 96,
+    "dcs_1010h": 66,
+    "dcs_1011h": 66,
+    "dcs_1020h": 29
+  },
+  "physical_nodes": 41,
+  "unique_signals": 220,
+  "feature_groups": {
+    "CO": [
+      17
+    ]
+  }
+}
