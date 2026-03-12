@@ -1,0 +1,77 @@
+{
+  "XGBoost": {
+    "model": "XGBoost",
+    "threshold": 0.5,
+    "n_samples": 4000,
+    "n_attacks": 157,
+    "n_predicted_attacks": 4000,
+    "precision": 0.03925,
+    "recall": 1.0,
+    "f1": 0.07553524176088526,
+    "confusion_matrix": [
+      [
+        0,
+        3843
+      ],
+      [
+        0,
+        157
+      ]
+    ],
+    "roc_auc": 0.9255789747593026,
+    "pr_auc": 0.42199259040588766,
+    "optimal_threshold": 0.6285973787307739,
+    "optimal_f1": 0.43781094185391456,
+    "detection_delay_seconds": 0.0
+  },
+  "LightGBM": {
+    "model": "LightGBM",
+    "threshold": 0.5,
+    "n_samples": 4000,
+    "n_attacks": 157,
+    "n_predicted_attacks": 53,
+    "precision": 1.0,
+    "recall": 0.3375796178343949,
+    "f1": 0.5047619047619047,
+    "confusion_matrix": [
+      [
+        3843,
+        0
+      ],
+      [
+        104,
+        53
+      ]
+    ],
+    "roc_auc": 0.7700931961660791,
+    "pr_auc": 0.4844030241251975,
+    "optimal_threshold": 0.37977623240865976,
+    "optimal_f1": 0.5118483374236877,
+    "detection_delay_seconds": 25.0
+  },
+  "RandomForest": {
+    "model": "RandomForest",
+    "threshold": 0.5,
+    "n_samples": 4000,
+    "n_attacks": 157,
+    "n_predicted_attacks": 27,
+    "precision": 0.5555555555555556,
+    "recall": 0.09554140127388536,
+    "f1": 0.16304347826086957,
+    "confusion_matrix": [
+      [
+        3831,
+        12
+      ],
+      [
+        142,
+        15
+      ]
+    ],
+    "roc_auc": 0.9813939149848098,
+    "pr_auc": 0.5703721797961138,
+    "optimal_threshold": 0.29499449146180334,
+    "optimal_f1": 0.7352941126762976,
+    "detection_delay_seconds": 139.0
+  }
+}

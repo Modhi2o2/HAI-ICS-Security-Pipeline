@@ -1,0 +1,70 @@
+{
+  "run_timestamp": "2026-03-12 20:07:43.825835",
+  "dataset": {
+    "version": "hai-23.05",
+    "train_shape": [
+      200000,
+      88
+    ],
+    "test_shape": [
+      50000,
+      88
+    ],
+    "combined_shape": [
+      250000,
+      88
+    ],
+    "memory_mb": 167.85,
+    "n_features": 86,
+    "sampling_rate_hz": 1
+  },
+  "data_quality": {
+    "missing_values": {},
+    "duplicates": 0,
+    "n_outlier_columns": 22
+  },
+  "labels": {
+    "attack_rate": 0.0119,
+    "n_normal": 247019,
+    "n_attack": 2981,
+    "class_imbalance_ratio": 82.9,
+    "n_attack_segments": 14
+  },
+  "feature_groups": {
+    "P1_Pressure": 2,
+    "P1_Flow": 3,
+    "P1_Temperature": 3,
+    "P1_Level": 1,
+    "P1_ControlValves": 6,
+    "P1_Pumps": 5,
+    "P1_Valves": 2,
+    "P2_Sensors": 1,
+    "P2_Status": 6,
+    "P3_Pressure": 1,
+    "P3_Flow": 1,
+    "P3_Level": 1,
+    "P3_LevelControl": 4,
+    "P4_Steam": 5
+  },
+  "assumptions": [
+    "HAI-23.05 version used as primary dataset",
+    "Training files contain only normal operation (no attacks)",
+    "Attack labels from separate label files aligned by timestamp",
+    "1 Hz sampling rate assumed throughout",
+    "All sensor values treated as continuous unless clearly binary (0/1)",
+    "Class imbalance addressed via scale_pos_weight in XGBoost and class_weight in RF/LGB"
+  ],
+  "leakage_risks": [
+    "None identified: time-aware split used, no shuffle before split",
+    "Rolling/lag features computed separately for train and test",
+    "Label column excluded from all feature matrices"
+  ],
+  "figures_generated": [
+    "reports/figures/missing_values.png",
+    "reports/figures/label_distribution.png",
+    "reports/figures/correlation_heatmap.png",
+    "reports/figures/sensor_distributions.png",
+    "reports/figures/attack_timeline.png",
+    "reports/figures/rolling_statistics.png"
+  ]
+}

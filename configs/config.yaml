@@ -1,0 +1,126 @@
+# HAI ICS Security Pipeline Configuration
+
+project:
+  name: "HAI ICS Security Pipeline"
+  version: "1.0.0"
+  seed: 42
+
+paths:
+  raw_data: "C:/Users/PC GAMING/Desktop/AI/HAI/hai-23.05/hai-23.05"
+  haiend_data: "C:/Users/PC GAMING/Desktop/AI/HAI/haiend-23.05"
+  processed_data: "data/processed"
+  outputs: "outputs"
+  models: "outputs/models"
+  metrics: "outputs/metrics"
+  predictions: "outputs/predictions"
+  synthetic: "outputs/synthetic"
+  reports: "reports"
+  figures: "reports/figures"
+
+data:
+  version: "hai-23.05"
+  train_files:
+    - "hai-train1.csv"
+    - "hai-train2.csv"
+    - "hai-train3.csv"
+    - "hai-train4.csv"
+  test_files:
+    - "hai-test1.csv"
+    - "hai-test2.csv"
+  label_files:
+    - "label-test1.csv"
+    - "label-test2.csv"
+  timestamp_col: "timestamp"
+  label_col: "Attack"
+  sampling_rate_hz: 1
+  # Use subset for fast runs; set to null for full dataset
+  max_train_rows: 200000
+  max_test_rows: 50000
+
+preprocessing:
+  window_size: 60        # 60-second windows
+  step_size: 10          # 10-second step (overlap)
+  scaler: "standard"     # standard, minmax, robust
+  impute_strategy: "forward_fill"
+  outlier_method: "iqr"  # iqr, zscore, none
+  outlier_threshold: 3.0
+  lag_features: [1, 5, 10, 30, 60]
+  rolling_windows: [10, 30, 60, 300]
+
+features:
+  use_lag_features: true
+  use_rolling_stats: true
+  use_frequency_features: false
+  use_derivative_features: true
+  drop_near_zero_variance: true
+  variance_threshold: 0.001
+
+models:
+  detection:
+    xgboost:
+      n_estimators: 300
+      max_depth: 6
+      learning_rate: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.8
+      scale_pos_weight: 20   # handles class imbalance
+      eval_metric: "auc"
+      early_stopping_rounds: 30
+    lightgbm:
+      n_estimators: 300
+      max_depth: 6
+      learning_rate: 0.05
+      num_leaves: 63
+      class_weight: "balanced"
+    random_forest:
+      n_estimators: 200
+      max_depth: 10
+      class_weight: "balanced"
+    lstm:
+      sequence_length: 60
+      hidden_size: 128
+      num_layers: 2
+      dropout: 0.3
+      batch_size: 256
+      epochs: 30
+      learning_rate: 0.001
+  anomaly:
+    isolation_forest:
+      n_estimators: 200
+      contamination: 0.05
+    autoencoder:
+      hidden_dims: [64, 32, 16, 32, 64]
+      epochs: 50
+      batch_size: 256
+      learning_rate: 0.001
+      threshold_percentile: 95
+
+diffusion:
+  model_type: "ddpm"          # ddpm (denoising diffusion probabilistic model)
+  timesteps: 200              # diffusion steps (lightweight)
+  sequence_length: 60
+  hidden_dim: 256
+  num_layers: 4
+  batch_size: 128
+  epochs: 50
+  learning_rate: 0.0002
+  beta_start: 0.0001
+  beta_end: 0.02
+  num_synthetic_samples: 1000
+
+digital_twin:
+  baseline_window: 3600       # seconds for baseline (1 hour)
+  anomaly_threshold: 0.5      # model probability threshold
+  health_decay_rate: 0.95
+  alert_cooldown: 60          # seconds between same-type alerts
+  severity_levels:
+    low: 0.3
+    medium: 0.6
+    high: 0.85
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8501
+  max_upload_size_mb: 500
+  default_lookback_minutes: 60
+  refresh_interval_seconds: 5

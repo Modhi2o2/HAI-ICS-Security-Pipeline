@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Large data files (keep structure, ignore raw CSVs)
+data/raw/*.csv
+data/raw/*.parquet
+data/processed/*.csv
+data/processed/*.parquet
+data/processed/*.pkl
+
+# Large model binaries
+outputs/models/*.pt
+outputs/models/*.joblib
+outputs/models/*.pkl
+outputs/synthetic/*.npy
+
+# Logs
+outputs/logs/
+*.log
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Secrets / env
+.env
+*.env
+
+# Streamlit cache
+.streamlit/secrets.toml
+
+# Keep folder structure
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!outputs/models/.gitkeep
+!outputs/metrics/.gitkeep
+!outputs/predictions/.gitkeep
+!outputs/synthetic/.gitkeep
+!reports/figures/.gitkeep
+!notebooks/.gitkeep

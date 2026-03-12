@@ -1,0 +1,42 @@
+{
+  "cyberattack": {
+    "mean_diff_abs": 400.5162353515625,
+    "std_diff_abs": 143.24171447753906,
+    "correlation_similarity": 0.16009848578105945
+  },
+  "sensor_drift": {
+    "mean_diff_abs": 459.7776184082031,
+    "std_diff_abs": 133.630126953125,
+    "correlation_similarity": 0.13754885952436235
+  },
+  "sudden_spike": {
+    "mean_diff_abs": 391.3858947753906,
+    "std_diff_abs": 165.89822387695312,
+    "correlation_similarity": 0.16836566092846794
+  },
+  "equipment_degradation": {
+    "mean_diff_abs": 451.9389343261719,
+    "std_diff_abs": 119.30375671386719,
+    "correlation_similarity": 0.1371743727265634
+  },
+  "communication_loss": {
+    "mean_diff_abs": 454.96246337890625,
+    "std_diff_abs": 139.17942810058594,
+    "correlation_similarity": 0.14382858579875124
+  },
+  "abnormal_operating_condition": {
+    "mean_diff_abs": 480.5194396972656,
+    "std_diff_abs": 135.2870635986328,
+    "correlation_similarity": 0.1465754164258648
+  },
+  "replay_attack": {
+    "mean_diff_abs": 402.38641357421875,
+    "std_diff_abs": 179.95733642578125,
+    "correlation_similarity": 0.15436241621837365
+  },
+  "setpoint_manipulation": {
+    "mean_diff_abs": 470.659912109375,
+    "std_diff_abs": 134.9789276123047,
+    "correlation_similarity": 0.14270043319225634
+  }
+}
