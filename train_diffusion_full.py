@@ -53,12 +53,12 @@ def parse_args():
     p.add_argument("--hai-root", default="C:/Users/PC GAMING/Desktop/AI/HAI")
     p.add_argument("--graph-dir", default=None,
                    help="Graph JSON dir (default: <hai-root>/graph/graph/boiler)")
-    p.add_argument("--epochs",     type=int,   default=100)
-    p.add_argument("--batch-size", type=int,   default=256)
-    p.add_argument("--hidden-dim", type=int,   default=256)
+    p.add_argument("--epochs",     type=int,   default=250)
+    p.add_argument("--batch-size", type=int,   default=512)
+    p.add_argument("--hidden-dim", type=int,   default=512)
     p.add_argument("--timesteps",  type=int,   default=300)
     p.add_argument("--lr",         type=float, default=2e-4)
-    p.add_argument("--max-rows",   type=int,   default=300_000)
+    p.add_argument("--max-rows",   type=int,   default=150_000)
     p.add_argument("--output-dir", default="outputs/models")
     p.add_argument("--no-haiend", action="store_true")
     p.add_argument("--fast",      action="store_true",
@@ -210,8 +210,28 @@ def train_diffusion(
 
     # Dataset — clip y to [0,2] for class conditioning
     y_cond = np.clip(y, 0, 2).astype(np.int64)
-    X_t  = torch.FloatTensor(X_norm)
-    y_t  = torch.LongTensor(y_cond)
+
+    # ── Attack oversampling ──────────────────────────────────────────────
+    # Attacks are only 0.6% of data. Oversample them to 30% so the model
+    # learns attack patterns properly (biggest single quality improvement).
+    normal_idx = np.where(y_cond == 0)[0]
+    attack_idx = np.where(y_cond == 1)[0]
+    if len(attack_idx) > 0:
+        n_attack_target = int(len(normal_idx) * 0.30)
+        repeat = int(np.ceil(n_attack_target / len(attack_idx)))
+        attack_oversampled = np.tile(attack_idx, repeat)[:n_attack_target]
+        balanced_idx = np.concatenate([normal_idx, attack_oversampled])
+        np.random.shuffle(balanced_idx)
+        X_norm_bal = X_norm[balanced_idx]
+        y_cond_bal = y_cond[balanced_idx]
+        logger.info(f"Attack oversampling: {len(attack_idx)} -> {n_attack_target} "
+                    f"({n_attack_target/len(balanced_idx)*100:.1f}% of balanced set)")
+    else:
+        X_norm_bal = X_norm
+        y_cond_bal = y_cond
+
+    X_t  = torch.FloatTensor(X_norm_bal)
+    y_t  = torch.LongTensor(y_cond_bal)
     ds   = TensorDataset(X_t, y_t)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True,
                         drop_last=True, num_workers=0, pin_memory=(device.type == "cuda"))

@@ -1,0 +1,59 @@
+{
+  "model_path": "outputs/models/diffusion_best.pt",
+  "n_synth_per_class": 5000,
+  "real_test_samples": 200000,
+  "real_test_attacks": 5755,
+  "TSTR": {
+    "f1": 0.21060707777884338,
+    "precision": 0.23501712328767124,
+    "recall": 0.19079061685490878,
+    "roc_auc": 0.6944087503669614,
+    "pr_auc": 0.12293182205580493,
+    "tp": 1098,
+    "fp": 3574,
+    "tn": 190671,
+    "fn": 4657,
+    "threshold": 0.5500000000000002
+  },
+  "Real+Synthetic": {
+    "f1": 0.0,
+    "precision": 0.0,
+    "recall": 0.0,
+    "roc_auc": 0.6187544995606528,
+    "pr_auc": 0.09060540152780985,
+    "tp": 0,
+    "fp": 0,
+    "tn": 194245,
+    "fn": 5755,
+    "threshold": 0.5
+  },
+  "Baseline": {
+    "f1": 0.0010946907498631637,
+    "precision": 0.0014104372355430183,
+    "recall": 0.0008944543828264759,
+    "roc_auc": 0.4508063956453042,
+    "pr_auc": 0.027963109456626865,
+    "tp": 3,
+    "fp": 2124,
+    "tn": 94522,
+    "fn": 3351,
+    "threshold": 0.1
+  },
+  "overall_score": 28,
+  "grade": "F",
+  "verdict": "NEEDS IMPROVEMENT",
+  "improvement_tips": [
+    {
+      "issue": "Low TSTR F1 (0.211)",
+      "fix": "Train more epochs (200-300). The model hasn't learned enough attack structure yet."
+    },
+    {
+      "issue": "ROC-AUC below 0.70 (0.694)",
+      "fix": "Increase hidden_dim to 512 and n_layers to 8 for a more expressive noise predictor."
+    },
+    {
+      "issue": "Low recall (0.191) \u2014 missing too many real attacks",
+      "fix": "Generate more attack samples (--n-synth 10000) and use a lower decision threshold (~0.20)."
+    }
+  ]
+}

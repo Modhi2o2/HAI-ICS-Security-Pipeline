@@ -250,7 +250,9 @@ def run_digital_twin_step(
     twin = DigitalTwin(config, feature_names=use_cols)
     twin.fit_baseline(X_normal)
 
-    if detection_model is not None:
+    # Auto-load best models (haiend LSTM + physics + fallback)
+    loaded = twin.load_best_model("outputs/models")
+    if not loaded and detection_model is not None:
         twin.set_detection_model(detection_model)
 
     # Run a test batch through the twin

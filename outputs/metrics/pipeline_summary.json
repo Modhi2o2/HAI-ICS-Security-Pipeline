@@ -1,83 +1,123 @@
 {
-  "run_timestamp": "2026-03-12 20:12:15.618573",
-  "elapsed_seconds": 41.7,
+  "run_timestamp": "2026-03-16 08:40:22.970982",
+  "elapsed_seconds": 299.1,
   "dataset_version": "hai-23.05",
   "train_shape": [
-    30000,
+    200000,
     88
   ],
   "test_shape": [
-    10000,
+    50000,
     88
   ],
-  "best_model": "LightGBM",
+  "best_model": "LSTM-AE-haiend(h=128,l=48,w=30)",
   "metrics": {
-    "precision": 1.0,
-    "recall": 0.3375796178343949,
-    "f1": 0.5047619047619047,
-    "roc_auc": 0.7700931961660791,
-    "pr_auc": 0.4844030241251975
+    "f1": 0.6886306120536133,
+    "precision": 0.7380952380952381,
+    "recall": 0.6453794799718904,
+    "roc_auc": 0.8650449589138034,
+    "threshold": 0.007676558503879513
   },
   "all_model_metrics": {
-    "XGBoost": {
-      "model": "XGBoost",
-      "threshold": 0.5,
-      "n_samples": 4000,
-      "n_attacks": 157,
-      "n_predicted_attacks": 4000,
-      "precision": 0.03925,
-      "recall": 1.0,
-      "f1": 0.07553524176088526,
-      "roc_auc": 0.9255789747593026,
-      "pr_auc": 0.42199259040588766,
-      "optimal_threshold": 0.6285973787307739,
-      "optimal_f1": 0.43781094185391456,
-      "detection_delay_seconds": 0.0
+    "LSTM_AE_raw": {
+      "f1": 0.38558766455131904,
+      "precision": 0.342144452717796,
+      "recall": 0.44166766790820616,
+      "roc_auc": 0.8020183710902878,
+      "threshold": 0.029456292152400948,
+      "tp": 18380,
+      "fp": 35340,
+      "tn": 1415250,
+      "fn": 23235
     },
-    "LightGBM": {
-      "model": "LightGBM",
-      "threshold": 0.5,
-      "n_samples": 4000,
-      "n_attacks": 157,
-      "n_predicted_attacks": 53,
-      "precision": 1.0,
-      "recall": 0.3375796178343949,
-      "f1": 0.5047619047619047,
-      "roc_auc": 0.7700931961660791,
-      "pr_auc": 0.4844030241251975,
-      "optimal_threshold": 0.37977623240865976,
-      "optimal_f1": 0.5118483374236877,
-      "detection_delay_seconds": 25.0
+    "LSTM_AE_ewm10": {
+      "f1": 0.3876900781091824,
+      "precision": 0.34829976257945927,
+      "recall": 0.4371260362849934,
+      "roc_auc": 0.7992040248494363,
+      "threshold": 0.029971363080098665,
+      "tp": 18191,
+      "fp": 34037,
+      "tn": 1416553,
+      "fn": 23424
     },
-    "RandomForest": {
-      "model": "RandomForest",
-      "threshold": 0.5,
-      "n_samples": 4000,
-      "n_attacks": 157,
-      "n_predicted_attacks": 27,
-      "precision": 0.5555555555555556,
-      "recall": 0.09554140127388536,
-      "f1": 0.16304347826086957,
-      "roc_auc": 0.9813939149848098,
-      "pr_auc": 0.5703721797961138,
-      "optimal_threshold": 0.29499449146180334,
-      "optimal_f1": 0.7352941126762976,
-      "detection_delay_seconds": 139.0
+    "LSTM_AE_ewm30": {
+      "f1": 0.3863047856526326,
+      "precision": 0.347055219422532,
+      "recall": 0.4355640994833594,
+      "roc_auc": 0.7965723453113545,
+      "threshold": 0.02945222441115357,
+      "tp": 18126,
+      "fp": 34102,
+      "tn": 1416488,
+      "fn": 23489
     },
-    "IsolationForest": {
-      "model": "IsolationForest",
-      "threshold": 0.5,
-      "n_samples": 4000,
-      "n_attacks": 157,
-      "n_predicted_attacks": 1238,
-      "precision": 0.11147011308562198,
-      "recall": 0.8789808917197452,
-      "f1": 0.1978494623655914,
-      "detection_delay_seconds": 11.0
+    "LSTM_AE_ewm60": {
+      "f1": 0.3795667907903708,
+      "precision": 0.3368019359642591,
+      "recall": 0.4347711161840682,
+      "roc_auc": 0.7936849308968406,
+      "threshold": 0.028797253938359472,
+      "tp": 18093,
+      "fp": 35627,
+      "tn": 1414963,
+      "fn": 23522
+    },
+    "LSTM_AE_ewm120": {
+      "f1": 0.3586432914791124,
+      "precision": 0.3043441840205063,
+      "recall": 0.436525291361288,
+      "roc_auc": 0.7866542753164483,
+      "threshold": 0.025542718632260503,
+      "tp": 18166,
+      "fp": 41523,
+      "tn": 1409067,
+      "fn": 23449
+    },
+    "LSTM_AE_ewm300": {
+      "f1": 0.2992625045637094,
+      "precision": 0.38145941921072224,
+      "recall": 0.24620929953141896,
+      "roc_auc": 0.7629262624951364,
+      "threshold": 0.12543254608167362,
+      "tp": 10246,
+      "fp": 16614,
+      "tn": 1433976,
+      "fn": 31369
+    },
+    "LSTM_AE_rmean10": {
+      "f1": 0.38577198086165193,
+      "precision": 0.3465765489775599,
+      "recall": 0.43496335455965396,
+      "roc_auc": 0.7981619629120619,
+      "threshold": 0.03016130597516388,
+      "tp": 18101,
+      "fp": 34127,
+      "tn": 1416463,
+      "fn": 23514
+    },
+    "LSTM_AE_rmean30": {
+      "f1": 0.3823833423910148,
+      "precision": 0.3435322049475377,
+      "recall": 0.43114261684488764,
+      "roc_auc": 0.7933016434515666,
+      "threshold": 0.0291267602766408,
+      "tp": 17942,
+      "fp": 34286,
+      "tn": 1416304,
+      "fn": 23673
     }
   },
   "diffusion_enabled": true,
   "digital_twin_health": 100.0,
   "digital_twin_alerts": 0,
-  "eda_completed": false
+  "eda_completed": true,
+  "training_note": "LSTM-AE on haiend (225 sensors): 60 epochs, window=30s",
+  "n_features": 190,
+  "training_versions": [
+    "hai-20.07",
+    "hai-21.03",
+    "hai-22.04",
+    "hai-23.05"
+  ]
 }

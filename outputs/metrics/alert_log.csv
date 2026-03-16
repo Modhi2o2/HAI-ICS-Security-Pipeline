@@ -1,0 +1,4 @@
+timestep,message,score,attack_type,confidence
+0,"[CRITICAL] Sensor Spike detected (score=1.000, confidence=MEDIUM)",1.0,sensor_spike,MEDIUM
+283,"[LOW] Sensor Spike detected (score=0.112, confidence=HIGH)",0.1118,sensor_spike,HIGH
+287,"[HIGH] Sensor Spike detected (score=0.126, confidence=HIGH)",0.1265,sensor_spike,HIGH

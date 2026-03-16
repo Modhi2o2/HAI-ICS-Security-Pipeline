@@ -1,453 +1,1000 @@
 """
-HAI Digital Twin Module
+HAI Digital Twin Module — v3  (multi-model, window-based scoring)
 
-Simulates the HAI boiler/steam ICS system behavior.
-Detects deviations from baseline, estimates health, and generates alerts.
+Detection layers (priority order):
+  Layer A  haiend LSTM-AE (225 sensors, window=30s)  — best model, F1=0.687
+  Layer B  38-feature LSTM-AE                         — fallback if haiend unavailable
+  Layer C  Physics residual (44 edges, Ridge)         — explainer + weak detector
+  Layer D  Z-score baseline deviation                 — always available
+  Layer E  Isolation Forest                           — unsupervised catch-all
 
-Components:
-- StateEstimator: tracks current system state
-- AnomalyDetector: detects deviations from baseline
-- RootCauseAnalyzer: identifies which sensors/subsystems are responsible
-- HealthScorer: computes overall system health (0-100)
-- AlertEngine: generates prioritized alerts with recommendations
-- ScenarioEngine: injects synthetic scenarios for what-if analysis
+Each layer contributes a normalised [0,1] score.
+Final score = weighted average of available layers.
+Confidence = number of independent layers that fired.
+
+Key change from v2: haiend LSTM needs a rolling (W=30, N=225) window tensor,
+not a flat single-sample vector.  Physics residual uses lagged lag buffers.
 """
 
+import sys
 import numpy as np
 import pandas as pd
 import json
 import joblib
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque
 
 from src.utils.logger import logger
 
 
+# ---------------------------------------------------------------------------
+# Layer weights
+# ---------------------------------------------------------------------------
+_W_LSTM_HAIEND = 0.60   # primary detector
+_W_LSTM_38     = 0.55   # fallback if haiend absent; else 0
+_W_PHYSICS     = 0.10   # weak detector / explainer
+_W_ZSCORE      = 0.20   # always present
+_W_ISOFOREST   = 0.10   # optional
+
+
+# ---------------------------------------------------------------------------
+# System State
+# ---------------------------------------------------------------------------
+
 class SystemState:
     """Represents the current estimated state of the ICS."""
 
     def __init__(self, feature_names: List[str]):
-        self.feature_names = feature_names
-        self.n_features = len(feature_names)
+        self.feature_names  = feature_names
+        self.n_features     = len(feature_names)
         self.current_values = np.zeros(self.n_features)
-        self.baseline_mean = np.zeros(self.n_features)
-        self.baseline_std = np.ones(self.n_features)
-        self.timestamp = datetime.now()
-        self.is_anomalous = False
-        self.anomaly_score = 0.0
-        self.health_score = 100.0
+        self.baseline_mean  = np.zeros(self.n_features)
+        self.baseline_std   = np.ones(self.n_features)
+        self.timestamp      = datetime.now()
+        self.is_anomalous   = False
+        self.anomaly_score  = 0.0
+        self.health_score   = 100.0
         self.active_alerts: List[str] = []
+        self.attack_type:   str = "none"
+        self.confidence:    str = "LOW"
 
     def update(self, values: np.ndarray, timestamp: datetime = None) -> None:
-        """Update current state with new sensor readings."""
         self.current_values = np.array(values).flatten()[:self.n_features]
         self.timestamp = timestamp or datetime.now()
 
     def get_deviations(self) -> np.ndarray:
-        """Compute Z-score deviation from baseline."""
-        return (self.current_values - self.baseline_mean) / (self.baseline_std + 1e-8)
+        n = min(len(self.current_values), len(self.baseline_mean))
+        return (self.current_values[:n] - self.baseline_mean[:n]) / (self.baseline_std[:n] + 1e-8)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize state to dictionary."""
         return {
-            "timestamp": str(self.timestamp),
-            "health_score": round(self.health_score, 2),
-            "anomaly_score": round(self.anomaly_score, 4),
-            "is_anomalous": bool(self.is_anomalous),
-            "active_alerts": self.active_alerts,
-            "sensor_values": {
+            "timestamp":              str(self.timestamp),
+            "health_score":           round(self.health_score, 2),
+            "anomaly_score":          round(self.anomaly_score, 4),
+            "is_anomalous":           bool(self.is_anomalous),
+            "attack_type":            self.attack_type,
+            "confidence":             self.confidence,
+            "active_alerts":          self.active_alerts,
+            "sensor_values":          {
                 name: round(float(val), 4)
                 for name, val in zip(self.feature_names[:20], self.current_values[:20])
             },
-            "top_deviating_sensors": self._get_top_deviating(5),
+            "top_deviating_sensors":  self._get_top_deviating(5),
+            "subsystem_scores":       self._subsystem_scores(),
         }
 
     def _get_top_deviating(self, n: int = 5) -> List[Dict]:
-        """Return top N most deviating sensors."""
-        deviations = self.get_deviations()
-        abs_devs = np.abs(deviations)
-        top_idx = np.argsort(abs_devs)[::-1][:n]
+        devs    = self.get_deviations()
+        abs_dev = np.abs(devs)
+        top_idx = np.argsort(abs_dev)[::-1][:n]
         return [
             {
-                "sensor": self.feature_names[i],
+                "sensor":        self.feature_names[i],
                 "current_value": round(float(self.current_values[i]), 4),
                 "baseline_mean": round(float(self.baseline_mean[i]), 4),
-                "z_score": round(float(deviations[i]), 2),
+                "z_score":       round(float(devs[i]), 2),
             }
             for i in top_idx if i < len(self.feature_names)
         ]
 
+    def _subsystem_scores(self) -> Dict[str, float]:
+        devs = np.abs(self.get_deviations())
+        subs: Dict[str, List[float]] = {}
+        for i, name in enumerate(self.feature_names):
+            if i >= len(devs):
+                break
+            prefix = name.split("_")[0] if "_" in name else "Other"
+            subs.setdefault(prefix, []).append(float(devs[i]))
+        return {k: round(float(np.mean(v)), 3) for k, v in subs.items() if v}
+
+
+# ---------------------------------------------------------------------------
+# Digital Twin
+# ---------------------------------------------------------------------------
 
 class DigitalTwin:
     """
-    Main Digital Twin for HAI ICS Boiler System.
+    HAI ICS Digital Twin — multi-model, window-based anomaly detection.
 
-    Provides:
-    - Real-time (batch) anomaly detection
-    - System health scoring
-    - Root cause analysis
-    - Scenario injection (attack/fault simulation)
-    - Alert generation with recommendations
+    Primary model: haiend LSTM-AE (225 sensors, window=30s, F1=0.687)
     """
 
+    ATTACK_PATTERNS = {
+        "sensor_spike":          {"pattern": "sudden_large",   "threshold_z": 8.0},
+        "setpoint_manipulation": {"pattern": "sustained_med",  "threshold_z": 4.0},
+        "sensor_drift":          {"pattern": "gradual",        "threshold_z": 2.5},
+        "replay_attack":         {"pattern": "frozen_values",  "threshold_z": 0.5},
+        "communication_loss":    {"pattern": "zero_values",    "threshold_z": 0.5},
+        "equipment_degradation": {"pattern": "noisy",          "threshold_z": 2.0},
+        "cyberattack":           {"pattern": "multi_sensor",   "threshold_z": 5.0},
+    }
+
     SCENARIO_DESCRIPTIONS = {
-        "attack": "Simulated cyberattack: adversarial manipulation of sensor/actuator values",
-        "sensor_failure": "Simulated sensor failure: one or more sensors reporting incorrect values",
-        "drift": "Simulated sensor drift: gradual linear bias in readings",
+        "attack":              "Simulated cyberattack: adversarial manipulation of sensor/actuator values",
+        "sensor_failure":      "Simulated sensor failure: one or more sensors reporting incorrect values",
+        "drift":               "Simulated sensor drift: gradual linear bias in readings",
         "communication_fault": "Simulated communication fault: frozen or dropped sensor readings",
-        "overload": "Simulated system overload: extreme values across pressure/flow/temperature",
-        "degradation": "Simulated equipment degradation: increasing noise + gradual drift",
-        "unknown": "Random abnormal event: combination of perturbation types",
+        "overload":            "Simulated system overload: extreme values across pressure/flow/temperature",
+        "degradation":         "Simulated equipment degradation: increasing noise + gradual drift",
+        "unknown":             "Random abnormal event: combination of perturbation types",
     }
 
     def __init__(self, config: Dict[str, Any], feature_names: List[str] = None):
-        self.config = config
-        self.twin_cfg = config.get("digital_twin", {})
+        self.config        = config
+        self.twin_cfg      = config.get("digital_twin", {})
         self.feature_names = feature_names or []
 
         # State
         self.state = SystemState(self.feature_names)
 
-        # History buffer (rolling window)
-        self.history_buffer = deque(maxlen=3600)  # 1 hour of 1-Hz data
+        # Rolling history
+        self.history_buffer  = deque(maxlen=3600)
+        self.score_history   = deque(maxlen=300)
+        self.predict_history = deque(maxlen=60)
 
-        # Baseline stats (computed from training data)
+        # Baseline
         self.baseline_mean: Optional[np.ndarray] = None
-        self.baseline_std: Optional[np.ndarray] = None
-        self.baseline_corr: Optional[np.ndarray] = None
+        self.baseline_std:  Optional[np.ndarray] = None
 
-        # Detection model (optional, set after training)
-        self.detection_model = None
-        self.anomaly_model = None
-        self.detection_threshold = self.twin_cfg.get("anomaly_threshold", 0.5)
+        # ── Layer A: haiend LSTM-AE ──────────────────────────────────────────
+        self._haiend_model       = None        # LSTMAutoencoder object
+        self._haiend_n_features  = 225
+        self._haiend_window      = 30
+        self._haiend_mean        = None        # (225,) float32
+        self._haiend_std         = None        # (225,) float32 — already clamped ≥1.0
+        self._haiend_threshold   = None        # raw MSE threshold from training
+        self._haiend_buffer      = deque(maxlen=30)   # rolling (W, N) window
+        self._haiend_score_buf   = deque(maxlen=600)  # running distribution
+        self._haiend_per_sensor  = None        # (225,) last per-sensor errors
+        self._haiend_columns: List[str] = []   # sensor column names if saved
+        self._haiend_last_raw: float   = 0.0  # last raw MSE (for eval)
 
-        # Health scoring
-        self.health_score = 100.0
-        self.health_decay = self.twin_cfg.get("health_decay_rate", 0.95)
+        # ── Layer B: 38-feature LSTM-AE fallback ────────────────────────────
+        self._fallback_model     = None
+        self._fallback_pkg       = None
+        self._fallback_type      = None        # "autoencoder" or "lstm"
 
-        # Alert history
-        self.alert_log: List[Dict] = []
-        self.alert_cooldowns: Dict[str, datetime] = {}
+        # ── Layer C: Physics residual ────────────────────────────────────────
+        self._physics_pkg        = None        # loaded joblib pkg
+        self._physics_edges: List[Tuple] = []  # [(src, tgt), ...]
+        self._physics_models: Dict = {}        # (src,tgt) -> Ridge
+        self._physics_lag_buffers: Dict[str, deque] = {}  # sensor -> deque(maxlen=35)
+        self._physics_score_buf  = deque(maxlen=600)
+        self._physics_p99        = None
+        self._physics_last_edges: List[Dict] = []   # last top violated edges
+
+        # ── Layer D: Z-score ─────────────────────────────────────────────────
+        # (uses baseline_mean / baseline_std — always available)
+
+        # ── Layer E: Isolation Forest ────────────────────────────────────────
+        self.anomaly_model       = None
+        self.iso_threshold       = 0.5
+
+        # Sensor name → index in feature_names (for physics lookup)
+        self._sensor_idx: Dict[str, int] = {}
+
+        # Backward-compat: keep old attribute names used by Streamlit
+        self.detection_model      = None
+        self.detection_model_type = "none"
+        self.detection_threshold  = self.twin_cfg.get("anomaly_threshold", 0.5)
+        self._ae_eng_state        = None
+        self._ae_smooth_type      = "ewm"
+        self._ae_smooth_window    = 30
+        self._ae_score_buffer     = deque(maxlen=300)
+        self._ae_score_p99        = None
+
+        # Health / alerts
+        self.health_score          = 100.0
+        self.consecutive_anomalies = 0
+        self.alert_log:        List[Dict] = []
+        self.alert_cooldowns:  Dict[str, datetime] = {}
         self.alert_cooldown_secs = self.twin_cfg.get("alert_cooldown", 60)
 
-        # Scenario injection state
+        # Scenario
         self.active_scenario: Optional[str] = None
-        self.scenario_data: Optional[np.ndarray] = None
-        self.scenario_idx: int = 0
+        self.scenario_data:   Optional[np.ndarray] = None
+        self.scenario_idx:    int = 0
 
         self._outputs_dir = Path(config["paths"]["outputs"])
         self._outputs_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info("Digital Twin initialized")
+        logger.info("Digital Twin v3 initialized (multi-model, window-based)")
+
+    # ------------------------------------------------------------------
+    # Baseline
+    # ------------------------------------------------------------------
 
     def fit_baseline(self, normal_data: np.ndarray) -> None:
-        """
-        Compute baseline statistics from normal operation data.
-
-        Args:
-            normal_data: Normal operation samples (n_samples, n_features)
-        """
         logger.info(f"Computing baseline from {len(normal_data):,} normal samples...")
-
         self.baseline_mean = normal_data.mean(axis=0)
-        self.baseline_std = normal_data.std(axis=0)
-
-        # Correlation matrix for relationship-based anomaly detection
-        n_cols = min(50, normal_data.shape[1])
-        self.baseline_corr = np.corrcoef(normal_data[:, :n_cols].T)
-        self.baseline_corr = np.nan_to_num(self.baseline_corr, nan=0.0)
-
-        # Update state baseline
+        self.baseline_std  = normal_data.std(axis=0)
         self.state.baseline_mean = self.baseline_mean
-        self.state.baseline_std = self.baseline_std
+        self.state.baseline_std  = self.baseline_std
+        logger.info("Baseline fitted.")
 
-        logger.info(f"Baseline fitted: mean range [{self.baseline_mean.min():.3f}, {self.baseline_mean.max():.3f}]")
-
-    def set_detection_model(self, model, anomaly_model=None) -> None:
-        """Attach trained detection model to the digital twin."""
+    def set_detection_model(self, model, threshold: float = None,
+                             anomaly_model=None) -> None:
         self.detection_model = model
-        self.anomaly_model = anomaly_model
-        logger.info("Detection model attached to Digital Twin")
+        if threshold is not None:
+            self.detection_threshold = threshold
+        if anomaly_model is not None:
+            self.anomaly_model = anomaly_model
+
+    # ------------------------------------------------------------------
+    # Model loading
+    # ------------------------------------------------------------------
+
+    def load_best_model(self, model_dir: str = "outputs/models") -> bool:
+        """
+        Auto-load the best available detection models from disk.
+
+        Priority:
+          1. haiend_lstm_detection.joblib  — primary (F1=0.687)
+          2. best_detection_model.joblib   — if it exists and is better
+          3. 38-feature autoencoder        — as fallback
+          4. physics_residual.joblib       — as explainer / layer C
+          5. isolation_forest.joblib       — as layer E
+        """
+        model_dir = Path(model_dir)
+        loaded_primary = False
+
+        # ── Layer A: haiend LSTM-AE ──────────────────────────────────────────
+        for fname in ["haiend_lstm_detection.joblib", "best_detection_model.joblib"]:
+            path = model_dir / fname
+            if not path.exists():
+                continue
+            try:
+                # Must patch __main__ before loading (model class was saved from __main__)
+                from train_haiend_lstm import LSTMAutoencoder as _LSTmHaiend
+                sys.modules["__main__"].LSTMAutoencoder = _LSTmHaiend
+
+                pkg = joblib.load(path)
+                if not isinstance(pkg, dict):
+                    continue
+                if pkg.get("model_type") != "LSTMAutoencoder_haiend":
+                    continue
+
+                self._haiend_model      = pkg["model"]
+                self._haiend_model.eval()
+                self._haiend_n_features = int(pkg.get("n_features", 225))
+                self._haiend_window     = int(pkg.get("window", 30))
+                self._haiend_mean       = pkg["data_mean"].astype(np.float32)
+                self._haiend_std        = pkg["data_std"].astype(np.float32)
+                self._haiend_threshold  = float(pkg.get("threshold", 0.01))
+                self._haiend_buffer     = deque(maxlen=self._haiend_window)
+                self._haiend_columns    = pkg.get("columns", [])
+
+                # Keep backward-compat attributes pointing to haiend model
+                self.detection_model      = self._haiend_model
+                self.detection_model_type = "lstm_haiend"
+                self.detection_threshold  = self._haiend_threshold
+
+                logger.info(
+                    f"[Layer A] haiend LSTM-AE loaded: {path.name}  "
+                    f"n_feat={self._haiend_n_features}  window={self._haiend_window}  "
+                    f"F1={pkg.get('best_f1', 0):.4f}"
+                )
+                loaded_primary = True
+                break
+            except Exception as e:
+                logger.warning(f"Could not load haiend LSTM from {path}: {e}")
+
+        # ── Layer B: 38-feature LSTM-AE fallback ────────────────────────────
+        for fname in ["lstm_ae_detection.joblib"]:
+            path = model_dir / fname
+            if not path.exists():
+                continue
+            try:
+                from retrain_lstm_ae import LSTMAutoencoder as _LSTM38
+                sys.modules["__main__"].LSTMAutoencoder = _LSTM38
+
+                pkg38 = joblib.load(path)
+                if isinstance(pkg38, dict) and "model" in pkg38:
+                    self._fallback_model = pkg38["model"]
+                    self._fallback_model.eval()
+                    self._fallback_pkg   = pkg38
+                    self._fallback_type  = "lstm"
+                    if not loaded_primary:
+                        self.detection_model      = self._fallback_model
+                        self.detection_model_type = "autoencoder"
+                        self._ae_eng_state        = pkg38.get("eng_state", None)
+                    logger.info(
+                        f"[Layer B] 38-feat LSTM-AE loaded: {fname}  "
+                        f"F1={pkg38.get('best_f1', 0):.4f}"
+                    )
+            except Exception as e:
+                logger.warning(f"Could not load 38-feat LSTM from {fname}: {e}")
+
+        # ── Layer C: Physics residual ────────────────────────────────────────
+        phys_path = model_dir / "physics_residual.joblib"
+        if phys_path.exists():
+            try:
+                self._physics_pkg    = joblib.load(phys_path)
+                self._physics_edges  = self._physics_pkg.get("edges", [])
+                self._physics_models = self._physics_pkg.get("models", {})
+                # Build per-sensor lag buffers for all sensors referenced by edges
+                all_sensors = set()
+                for (s, t) in self._physics_edges:
+                    all_sensors.add(s)
+                    all_sensors.add(t)
+                for s in all_sensors:
+                    self._physics_lag_buffers[s] = deque(maxlen=35)
+                logger.info(
+                    f"[Layer C] Physics residual loaded: {len(self._physics_edges)} edges, "
+                    f"{len(all_sensors)} sensors"
+                )
+            except Exception as e:
+                logger.warning(f"Could not load physics model: {e}")
+
+        # ── Layer E: Isolation Forest ────────────────────────────────────────
+        iso_path = model_dir / "isolation_forest.joblib"
+        if iso_path.exists():
+            try:
+                self.anomaly_model = joblib.load(iso_path)
+                logger.info("[Layer E] Isolation Forest loaded")
+            except Exception as e:
+                logger.warning(f"Could not load IsoForest: {e}")
+
+        # Build sensor→index lookup
+        self._sensor_idx = {name: i for i, name in enumerate(self.feature_names)}
+
+        return loaded_primary or (self._fallback_model is not None)
+
+    # ------------------------------------------------------------------
+    # Core processing
+    # ------------------------------------------------------------------
 
     def ingest(self, sample: np.ndarray, timestamp: datetime = None) -> Dict[str, Any]:
-        """
-        Process a single sensor reading.
-
-        Args:
-            sample: Sensor values (1D array of shape n_features)
-            timestamp: Optional timestamp
-
-        Returns:
-            State update dict with anomaly info and health score
-        """
+        """Process one sensor reading through all detection layers."""
         sample = np.array(sample).flatten()
 
-        # If scenario is active, inject perturbation
+        # Scenario injection
         if self.active_scenario is not None and self.scenario_data is not None:
             if self.scenario_idx < len(self.scenario_data):
-                perturbation = self.scenario_data[self.scenario_idx]
-                n = min(len(sample), len(perturbation))
-                sample[:n] = perturbation[:n]
+                pert = self.scenario_data[self.scenario_idx]
+                n = min(len(sample), len(pert))
+                sample[:n] = pert[:n]
                 self.scenario_idx += 1
             else:
                 self.stop_scenario()
 
-        # Update state
         self.state.update(sample, timestamp)
         self.history_buffer.append(sample.copy())
 
-        # Compute anomaly score
-        anomaly_score, is_anomalous = self._detect_anomaly(sample)
-        self.state.anomaly_score = anomaly_score
-        self.state.is_anomalous = is_anomalous
+        # Multi-layer detection
+        anomaly_score, is_anomalous, confidence, layers, layer_scores = \
+            self._detect_anomaly(sample)
 
-        # Update health score
-        self.health_score = self._update_health(is_anomalous, anomaly_score)
+        self.score_history.append(anomaly_score)
+        self.predict_history.append(int(is_anomalous))
+
+        self.state.anomaly_score = anomaly_score
+        self.state.is_anomalous  = is_anomalous
+        self.state.confidence    = confidence
+
+        if is_anomalous:
+            self.consecutive_anomalies += 1
+            self.state.attack_type = self._classify_attack(sample)
+        else:
+            self.consecutive_anomalies = 0
+            self.state.attack_type = "none"
+
+        self.health_score       = self._update_health(is_anomalous, anomaly_score)
         self.state.health_score = self.health_score
 
-        # Generate alerts if needed
-        alerts = self._check_alerts(sample, is_anomalous, anomaly_score)
+        alerts = self._check_alerts(sample, is_anomalous, anomaly_score, layers)
         self.state.active_alerts = [a["message"] for a in alerts]
 
-        return self.state.to_dict()
+        result = self.state.to_dict()
+        result["layers_active"]         = layers
+        result["layer_scores"]          = layer_scores
+        result["consecutive_anomalies"] = self.consecutive_anomalies
+        return result
 
-    def process_batch(self, data: np.ndarray) -> pd.DataFrame:
-        """
-        Process a batch of sensor readings.
-
-        Args:
-            data: Batch of readings (n_samples, n_features)
-
-        Returns:
-            DataFrame with anomaly scores, predictions, health scores
-        """
+    def process_batch(self, data: np.ndarray,
+                      timestamps: List[datetime] = None) -> pd.DataFrame:
         results = []
-
         for i, sample in enumerate(data):
-            result = self.ingest(sample)
-            result["sample_idx"] = i
-            results.append(result)
-
+            ts = timestamps[i] if timestamps and i < len(timestamps) else None
+            r  = self.ingest(sample, timestamp=ts)
+            r["sample_idx"] = i
+            results.append(r)
         return pd.DataFrame(results)
 
-    def _detect_anomaly(self, sample: np.ndarray) -> Tuple[float, bool]:
-        """
-        Compute anomaly score for a sample.
+    # ------------------------------------------------------------------
+    # Layer A — haiend LSTM-AE (window-based)
+    # ------------------------------------------------------------------
 
-        Uses ML model if available, falls back to Z-score baseline deviation.
+    def _lstm_haiend_score(self, sample: np.ndarray
+                           ) -> Tuple[float, Optional[np.ndarray], bool]:
         """
-        # Strategy 1: ML model (most accurate)
-        if self.detection_model is not None:
+        Score using the 225-sensor LSTM-AE.
+
+        Returns
+        -------
+        norm_score  : float  0-1 (normalised by running p97)
+        per_sensor  : ndarray (225,) per-sensor MSE, or None
+        above_thr   : bool   raw MSE >= model threshold
+        """
+        try:
+            import torch
+            N = self._haiend_n_features
+            W = self._haiend_window
+
+            # Map incoming sample to N-dim vector
+            n_in = len(sample)
+            if n_in >= N:
+                vec = sample[:N].astype(np.float32)
+            else:
+                vec = np.zeros(N, dtype=np.float32)
+                vec[:n_in] = sample[:n_in].astype(np.float32)
+
+            self._haiend_buffer.append(vec)
+
+            # Build window (pad front with zeros if < W samples seen)
+            buf = list(self._haiend_buffer)
+            if len(buf) < W:
+                pad = [np.zeros(N, dtype=np.float32)] * (W - len(buf))
+                buf = pad + buf
+            window_arr = np.array(buf[-W:], dtype=np.float32)   # (W, N)
+
+            # Normalise
+            window_norm = (window_arr - self._haiend_mean) / self._haiend_std
+
+            # Forward pass
+            x = torch.from_numpy(window_norm[np.newaxis])        # (1, W, N)
+            self._haiend_model.eval()
+            with torch.no_grad():
+                recon      = self._haiend_model(x)               # (1, W, N)
+                sq_err     = (x - recon) ** 2                    # (1, W, N)
+                per_sensor = sq_err.mean(dim=1).squeeze(0).cpu().numpy()  # (N,)
+                raw_score  = float(per_sensor.mean())
+
+            self._haiend_per_sensor = per_sensor
+            self._haiend_score_buf.append(raw_score)
+            self._haiend_last_raw  = raw_score
+
+            # Absolute threshold from training (pre-calibrated for F1=0.687)
+            above_thr = raw_score >= self._haiend_threshold
+
+            # Running p97 normalisation — used only for display / weighted score
+            if len(self._haiend_score_buf) >= 20:
+                p97 = float(np.percentile(list(self._haiend_score_buf), 97))
+            else:
+                p97 = max(self._haiend_threshold * 3.0, 1e-6)
+
+            norm_score = float(np.clip(raw_score / (p97 + 1e-8), 0.0, 2.0))
+
+            return norm_score, per_sensor, above_thr
+
+        except Exception as e:
+            logger.debug(f"haiend LSTM score error: {e}")
+            return 0.0, None, False
+
+    # ------------------------------------------------------------------
+    # Layer B — 38-feature autoencoder fallback
+    # ------------------------------------------------------------------
+
+    def _fallback_score(self, sample: np.ndarray) -> float:
+        """Score using 38-feature LSTM-AE fallback. Returns normalised [0,1]."""
+        try:
+            import torch
+            pkg = self._fallback_pkg
+            W   = pkg["window"]
+            mean = pkg["data_mean"]
+            std  = pkg["data_std"]
+            N   = len(mean)
+
+            n_in = len(sample)
+            vec  = sample[:N].astype(np.float32) if n_in >= N else \
+                   np.pad(sample.astype(np.float32), (0, N - n_in))
+
+            # Use history buffer for the window
+            hist  = [np.array(h[:N], dtype=np.float32) for h in list(self.history_buffer)[-(W-1):]]
+            hist.append(vec)
+            if len(hist) < W:
+                pad  = [np.zeros(N, dtype=np.float32)] * (W - len(hist))
+                hist = pad + hist
+            window_arr  = np.array(hist[-W:], dtype=np.float32)  # (W, N)
+            window_norm = (window_arr - mean) / (std + 1e-8)
+
+            x = torch.from_numpy(window_norm[np.newaxis])         # (1, W, N)
+            self._fallback_model.eval()
+            with torch.no_grad():
+                err = float(self._fallback_model.reconstruction_error(x)[0])
+
+            self._ae_score_buffer.append(err)
+            if len(self._ae_score_buffer) >= 10:
+                self._ae_score_p99 = float(np.percentile(list(self._ae_score_buffer), 97))
+            p99 = self._ae_score_p99 or max(err * 2, 1e-6)
+            return float(np.clip(err / (p99 + 1e-8), 0.0, 1.5))
+
+        except Exception as e:
+            logger.debug(f"Fallback score error: {e}")
+            return 0.0
+
+    # ------------------------------------------------------------------
+    # Layer C — Physics residual
+    # ------------------------------------------------------------------
+
+    def _physics_score(self, sample: np.ndarray) -> Tuple[float, List[Dict]]:
+        """
+        Compute physics residual score.
+
+        Returns
+        -------
+        norm_score   : float 0-1
+        top_edges    : list of dicts describing most-violated physical edges
+        """
+        if not self._physics_models:
+            return 0.0, []
+        try:
+            # Get sensor value by name
+            def get_val(name: str) -> float:
+                idx = self._sensor_idx.get(name, -1)
+                if 0 <= idx < len(sample):
+                    return float(sample[idx])
+                # Try haiend buffer (last sample)
+                if self._haiend_columns and name in self._haiend_columns:
+                    col_idx = self._haiend_columns.index(name)
+                    if self._haiend_buffer:
+                        return float(list(self._haiend_buffer)[-1][col_idx])
+                return 0.0
+
+            # Update lag buffers
+            for name in self._physics_lag_buffers:
+                self._physics_lag_buffers[name].append(get_val(name))
+
+            lags = [0, 1, 2, 5, 10, 30]
+            residuals = []
+            for (src, tgt) in self._physics_edges:
+                mdl = self._physics_models.get((src, tgt))
+                if mdl is None:
+                    continue
+                buf = list(self._physics_lag_buffers.get(src, []))
+                if len(buf) < 31:
+                    continue
+                feats = np.array(
+                    [buf[-1 - lag] if lag < len(buf) else buf[0] for lag in lags],
+                    dtype=np.float64
+                ).reshape(1, -1)
+                pred   = float(mdl.predict(feats)[0])
+                actual = get_val(tgt)
+                residuals.append({
+                    "edge":     f"{src}→{tgt}",
+                    "src":      src,
+                    "tgt":      tgt,
+                    "actual":   round(actual, 4),
+                    "predicted": round(pred, 4),
+                    "residual": abs(actual - pred),
+                })
+
+            if not residuals:
+                return 0.0, []
+
+            resid_vals = np.array([r["residual"] for r in residuals])
+            mean_resid = float(resid_vals.mean())
+
+            self._physics_score_buf.append(mean_resid)
+            if len(self._physics_score_buf) >= 50:
+                self._physics_p99 = float(
+                    np.percentile(list(self._physics_score_buf), 97))
+            p99 = self._physics_p99 or max(mean_resid * 3, 1e-6)
+
+            norm_score = float(np.clip(mean_resid / (p99 + 1e-8), 0.0, 1.5))
+            top_edges  = sorted(residuals, key=lambda x: -x["residual"])[:5]
+            self._physics_last_edges = top_edges
+            return norm_score, top_edges
+
+        except Exception as e:
+            logger.debug(f"Physics score error: {e}")
+            return 0.0, []
+
+    # ------------------------------------------------------------------
+    # Layer D — Z-score
+    # ------------------------------------------------------------------
+
+    def _zscore_score(self, sample: np.ndarray) -> float:
+        if self.baseline_mean is None:
+            return 0.0
+        n  = min(len(sample), len(self.baseline_mean))
+        z  = np.abs((sample[:n] - self.baseline_mean[:n]) / (self.baseline_std[:n] + 1e-8))
+        p90 = float(np.percentile(z, 90))
+        return float(np.clip(p90 / 10.0, 0.0, 1.0))
+
+    # ------------------------------------------------------------------
+    # Combined detection
+    # ------------------------------------------------------------------
+
+    def _detect_anomaly(self, sample: np.ndarray
+                        ) -> Tuple[float, bool, str, List[str], Dict[str, float]]:
+        """
+        Run all available layers and combine into a single anomaly decision.
+
+        Returns
+        -------
+        anomaly_score  : float  0-1
+        is_anomalous   : bool
+        confidence     : str    HIGH / MEDIUM / LOW
+        layers_fired   : list[str]
+        layer_scores   : dict   raw [0-1] score per layer name
+        """
+        scores:       Dict[str, float] = {}
+        weights:      Dict[str, float] = {}
+        layers_fired: List[str]        = []
+
+        # Layer A — haiend LSTM-AE
+        if self._haiend_model is not None:
+            ns, _per, above = self._lstm_haiend_score(sample)
+            scores["lstm_haiend"]     = ns
+            scores["lstm_haiend_raw"] = getattr(self, "_haiend_last_raw", 0.0)
+            weights["lstm_haiend"]    = _W_LSTM_HAIEND
+            # Fire on pre-calibrated absolute threshold (gives same F1 as batch mode)
+            if above:
+                layers_fired.append("LSTM-haiend")
+
+        # Layer B — 38-feat fallback (only if haiend absent)
+        elif self._fallback_model is not None:
+            fs = self._fallback_score(sample)
+            scores["lstm_fallback"]  = fs
+            weights["lstm_fallback"] = _W_LSTM_38
+            if fs >= 0.55:
+                layers_fired.append("LSTM-fallback")
+
+        # Layer C — Physics residual
+        if self._physics_models:
+            ps, _edges = self._physics_score(sample)
+            scores["physics"]  = ps
+            weights["physics"] = _W_PHYSICS
+            if ps >= 0.65:
+                layers_fired.append("Physics")
+
+        # Layer D — Z-score (always)
+        zs = self._zscore_score(sample)
+        scores["zscore"]  = zs
+        weights["zscore"] = _W_ZSCORE
+        if zs >= 0.30:
+            layers_fired.append("Z-score")
+
+        # Layer E — Isolation Forest
+        if self.anomaly_model is not None:
             try:
-                sample_2d = sample.reshape(1, -1)
-                prob = self.detection_model.predict_proba(sample_2d)[0][1]
-                is_anomalous = prob >= self.detection_threshold
-                return float(prob), bool(is_anomalous)
+                iso_raw   = -self.anomaly_model.score_samples(sample.reshape(1, -1))[0]
+                iso_score = float(np.clip(iso_raw / (self.iso_threshold * 2 + 1e-8), 0, 1))
+                scores["isolation"]  = iso_score
+                weights["isolation"] = _W_ISOFOREST
+                if iso_raw >= self.iso_threshold:
+                    layers_fired.append("IsoForest")
             except Exception:
                 pass
 
-        # Strategy 2: Z-score deviation from baseline
-        if self.baseline_mean is not None and self.baseline_std is not None:
-            n = min(len(sample), len(self.baseline_mean))
-            z_scores = np.abs((sample[:n] - self.baseline_mean[:n]) / (self.baseline_std[:n] + 1e-8))
-            anomaly_score = float(np.percentile(z_scores, 90))  # 90th percentile Z-score
+        # Weighted combination
+        total_w = sum(weights[k] for k in scores if k in weights)
+        total_s = sum(scores[k] * weights.get(k, 0) for k in scores)
+        final   = total_s / total_w if total_w > 0 else 0.0
+        final   = float(np.clip(final, 0.0, 1.0))
 
-            is_anomalous = anomaly_score > 3.0  # 3-sigma rule
+        n_fired    = len(layers_fired)
+        confidence = "HIGH" if n_fired >= 2 else ("MEDIUM" if n_fired == 1 else "LOW")
 
-            # Normalize to [0, 1]
-            normalized_score = min(1.0, anomaly_score / 10.0)
-            return normalized_score, is_anomalous
+        # Primary decision: LSTM threshold (pre-calibrated for F1=0.687)
+        # Other layers contribute to the score/confidence display but don't override
+        lstm_fired   = "LSTM-haiend" in layers_fired or "LSTM-fallback" in layers_fired
+        is_anomalous = lstm_fired
 
-        return 0.0, False
+        return final, bool(is_anomalous), confidence, layers_fired, scores
+
+    # ------------------------------------------------------------------
+    # Health scoring
+    # ------------------------------------------------------------------
 
     def _update_health(self, is_anomalous: bool, anomaly_score: float) -> float:
-        """Update system health score based on anomaly detection."""
         if is_anomalous:
-            # Decay health proportional to anomaly severity
-            severity = min(1.0, anomaly_score)
-            self.health_score = max(0.0, self.health_score - severity * 5.0)
+            accel = min(3.0, 1.0 + self.consecutive_anomalies * 0.1)
+            drop  = anomaly_score * 8.0 * accel
+            self.health_score = max(0.0, self.health_score - drop)
         else:
-            # Slowly recover toward 100 when normal
-            self.health_score = min(100.0, self.health_score + 0.1)
-
+            gap      = 100.0 - self.health_score
+            recovery = gap * 0.05
+            self.health_score = min(100.0, self.health_score + max(recovery, 0.2))
         return round(self.health_score, 2)
 
+    # ------------------------------------------------------------------
+    # Attack classification
+    # ------------------------------------------------------------------
+
+    def _classify_attack(self, sample: np.ndarray) -> str:
+        if self.baseline_mean is None:
+            return "unknown"
+        n      = min(len(sample), len(self.baseline_mean))
+        z      = (sample[:n] - self.baseline_mean[:n]) / (self.baseline_std[:n] + 1e-8)
+        abs_z  = np.abs(z)
+        max_z  = float(abs_z.max()) if len(abs_z) > 0 else 0.0
+        n_high = int((abs_z > 3.0).sum())
+
+        # Communication loss: sensors unexpectedly drop to zero relative to their baseline
+        # (Don't flag sensors that are normally zero — e.g. constant DCS binary states)
+        baseline_nonzero = np.abs(self.baseline_mean[:n]) > 0.1
+        if baseline_nonzero.sum() > 5:
+            dropped = (np.abs(sample[:n]) < 0.01) & baseline_nonzero
+            drop_rate = float(dropped.sum()) / float(baseline_nonzero.sum())
+            if drop_rate > 0.5:
+                return "communication_loss"
+
+        if len(self.history_buffer) >= 5:
+            recent = np.array(list(self.history_buffer)[-5:])
+            if recent.shape[0] >= 2 and np.abs(np.diff(recent, axis=0)).mean() < 0.001:
+                return "replay_attack"
+
+        if max_z > 10.0:           return "sensor_spike"
+        if max_z > 5.0 and n_high >= 3: return "cyberattack"
+        if max_z > 5.0:            return "setpoint_manipulation"
+        if max_z > 2.5 and n_high >= 5: return "equipment_degradation"
+        return "sensor_drift"
+
+    # ------------------------------------------------------------------
+    # Alert engine
+    # ------------------------------------------------------------------
+
     def _check_alerts(self, sample: np.ndarray, is_anomalous: bool,
-                       anomaly_score: float) -> List[Dict]:
-        """Generate alerts based on detection results."""
-        alerts = []
-        now = datetime.now()
+                       anomaly_score: float, layers: List[str]) -> List[Dict]:
+        if not is_anomalous:
+            return []
 
-        severity_cfg = self.twin_cfg.get("severity_levels", {})
+        alerts  = []
+        now     = datetime.now()
+        sev_cfg = self.twin_cfg.get("severity_levels", {})
 
-        if is_anomalous:
-            # Determine severity level
-            if anomaly_score >= severity_cfg.get("high", 0.85):
-                severity = "HIGH"
-                recommendation = "Immediate inspection required. Consider emergency shutdown."
-            elif anomaly_score >= severity_cfg.get("medium", 0.6):
-                severity = "MEDIUM"
-                recommendation = "Investigate anomalous sensors. Verify readings manually."
-            else:
-                severity = "LOW"
-                recommendation = "Monitor closely. Check sensor calibration."
+        if anomaly_score >= sev_cfg.get("high", 0.80) or self.consecutive_anomalies >= 10:
+            severity = "CRITICAL"
+            recommendation = (
+                "Immediate action required. Verify physical plant. "
+                "Consider emergency shutdown if readings cannot be explained."
+            )
+        elif anomaly_score >= sev_cfg.get("medium", 0.60) or self.consecutive_anomalies >= 5:
+            severity = "HIGH"
+            recommendation = (
+                "Investigate anomalous sensors now. "
+                "Check control loops and recent operator commands."
+            )
+        elif anomaly_score >= sev_cfg.get("low", 0.40):
+            severity = "MEDIUM"
+            recommendation = "Monitor closely. Verify sensor calibration and network integrity."
+        else:
+            severity = "LOW"
+            recommendation = "Minor deviation detected. Log and continue monitoring."
 
-            alert_key = f"anomaly_{severity}"
-            last_alert = self.alert_cooldowns.get(alert_key)
+        attack_type = self.state.attack_type
+        confidence  = self.state.confidence
+        alert_key   = f"{severity}_{attack_type}"
+        last_alert  = self.alert_cooldowns.get(alert_key)
 
-            if last_alert is None or (now - last_alert).total_seconds() > self.alert_cooldown_secs:
-                # Root cause analysis
-                root_cause = self.analyze_root_cause(sample)
+        if last_alert and (now - last_alert).total_seconds() < self.alert_cooldown_secs:
+            return alerts
 
-                alert = {
-                    "timestamp": str(now),
-                    "severity": severity,
-                    "anomaly_score": round(anomaly_score, 4),
-                    "message": f"[{severity}] Anomaly detected (score={anomaly_score:.3f})",
-                    "recommendation": recommendation,
-                    "root_cause": root_cause,
-                    "scenario": self.active_scenario,
-                }
-                alerts.append(alert)
-                self.alert_log.append(alert)
-                self.alert_cooldowns[alert_key] = now
+        root_cause = self.analyze_root_cause(sample)
+        top_sensor = (root_cause.get("top_sensors") or [{}])[0].get("sensor", "unknown")
 
-                logger.warning(f"ALERT [{severity}]: anomaly_score={anomaly_score:.3f}")
+        alert = {
+            "timestamp":         str(now),
+            "severity":          severity,
+            "confidence":        confidence,
+            "anomaly_score":     round(anomaly_score, 4),
+            "attack_type":       attack_type,
+            "layers_detected":   layers,
+            "message": (
+                f"[{severity}] {attack_type.replace('_', ' ').title()} detected "
+                f"(score={anomaly_score:.3f}, confidence={confidence})"
+            ),
+            "top_sensor":        top_sensor,
+            "recommendation":    recommendation,
+            "root_cause":        root_cause,
+            "scenario":          self.active_scenario,
+            "health_score":      round(self.health_score, 1),
+            "consecutive":       self.consecutive_anomalies,
+        }
 
+        alerts.append(alert)
+        self.alert_log.append(alert)
+        self.alert_cooldowns[alert_key] = now
+        logger.warning(
+            f"ALERT [{severity}] {attack_type}  score={anomaly_score:.3f}  "
+            f"confidence={confidence}  sensor={top_sensor}"
+        )
         return alerts
 
-    def analyze_root_cause(self, sample: np.ndarray) -> Dict[str, Any]:
-        """
-        Identify root cause of anomaly.
+    # ------------------------------------------------------------------
+    # Root cause analysis  (enhanced with per-sensor LSTM errors + physics)
+    # ------------------------------------------------------------------
 
-        Returns top deviating sensors, estimated subsystem impact,
-        and probable cause description.
-        """
+    def analyze_root_cause(self, sample: np.ndarray) -> Dict[str, Any]:
         if self.baseline_mean is None:
             return {"error": "Baseline not fitted"}
 
-        n = min(len(sample), len(self.baseline_mean))
-        z_scores = (sample[:n] - self.baseline_mean[:n]) / (self.baseline_std[:n] + 1e-8)
-        abs_z = np.abs(z_scores)
-
-        # Top contributing sensors
-        top_n = min(5, len(self.feature_names))
-        top_idx = np.argsort(abs_z)[::-1][:top_n]
-
-        top_sensors = []
-        for idx in top_idx:
-            if idx < len(self.feature_names):
-                top_sensors.append({
-                    "sensor": self.feature_names[idx],
-                    "z_score": round(float(z_scores[idx]), 2),
-                    "current": round(float(sample[idx]), 4),
-                    "baseline": round(float(self.baseline_mean[idx]), 4),
-                })
-
-        # Subsystem analysis
-        subsystem_scores = self._compute_subsystem_scores(abs_z)
-
-        # Probable cause inference
+        n     = min(len(sample), len(self.baseline_mean))
+        z     = (sample[:n] - self.baseline_mean[:n]) / (self.baseline_std[:n] + 1e-8)
+        abs_z = np.abs(z)
         max_z = float(abs_z.max()) if len(abs_z) > 0 else 0.0
-        if max_z > 10:
-            probable_cause = "Sensor spoofing or command injection attack"
-        elif max_z > 5:
-            probable_cause = "Significant process deviation — check actuators and control loops"
-        elif max_z > 3:
-            probable_cause = "Gradual drift or calibration issue"
+
+        # Primary signal: per-sensor LSTM reconstruction error (most precise)
+        if self._haiend_per_sensor is not None:
+            err   = self._haiend_per_sensor
+            names = (self._haiend_columns if self._haiend_columns
+                     else [f"sensor_{i}" for i in range(len(err))])
+            top_n   = min(10, len(err))
+            top_idx = np.argsort(err)[::-1][:top_n]
+            top_sensors = [
+                {
+                    "sensor":    names[i] if i < len(names) else f"sensor_{i}",
+                    "lstm_err":  round(float(err[i]), 6),
+                    "z_score":   round(float(z[i]), 2) if i < len(z) else None,
+                    "current":   round(float(sample[i]), 4) if i < len(sample) else None,
+                    "baseline":  round(float(self.baseline_mean[i]), 4)
+                                 if i < len(self.baseline_mean) else None,
+                    "deviation": f"{'+' if (i < len(z) and z[i] > 0) else ''}"
+                                 f"{z[i]:.1f}σ" if i < len(z) else "n/a",
+                }
+                for i in top_idx
+            ]
         else:
-            probable_cause = "Minor process variation — within monitoring threshold"
+            top_n   = min(5, len(self.feature_names))
+            top_idx = np.argsort(abs_z)[::-1][:top_n]
+            top_sensors = [
+                {
+                    "sensor":    self.feature_names[i],
+                    "z_score":   round(float(z[i]), 2),
+                    "current":   round(float(sample[i]), 4),
+                    "baseline":  round(float(self.baseline_mean[i]), 4),
+                    "deviation": f"{'+' if z[i] > 0 else ''}{z[i]:.1f}σ",
+                }
+                for i in top_idx if i < len(self.feature_names)
+            ]
 
-        return {
-            "top_sensors": top_sensors,
-            "subsystem_scores": subsystem_scores,
-            "probable_cause": probable_cause,
-            "max_z_score": round(max_z, 2),
+        subsystem_scores = self.state._subsystem_scores()
+        worst_sub = max(subsystem_scores, key=subsystem_scores.get) \
+                    if subsystem_scores else "Unknown"
+
+        if max_z > 10:   probable_cause = f"Sensor spoofing or command injection in {worst_sub}"
+        elif max_z > 5:  probable_cause = f"Significant process deviation in {worst_sub} — check actuators"
+        elif max_z > 3:  probable_cause = f"Gradual drift or calibration issue in {worst_sub}"
+        else:            probable_cause = "Minor process variation — within extended monitoring threshold"
+
+        result = {
+            "top_sensors":        top_sensors[:5],
+            "subsystem_scores":   subsystem_scores,
+            "worst_subsystem":    worst_sub,
+            "probable_cause":     probable_cause,
+            "max_z_score":        round(max_z, 2),
+            "n_sensors_above_3s": int((abs_z > 3.0).sum()),
+            "detection_source":   "LSTM-per-sensor" if self._haiend_per_sensor is not None
+                                   else "Z-score",
         }
 
-    def _compute_subsystem_scores(self, abs_z_scores: np.ndarray) -> Dict[str, float]:
-        """Compute anomaly contribution per subsystem (P1, P2, P3, P4)."""
-        subsystems = {}
+        # Append physics violations if available
+        if self._physics_last_edges:
+            result["physics_violations"] = [
+                {
+                    "edge":      e["edge"],
+                    "residual":  round(e["residual"], 4),
+                    "actual":    e["actual"],
+                    "predicted": e["predicted"],
+                }
+                for e in self._physics_last_edges[:5]
+            ]
 
-        for i, name in enumerate(self.feature_names):
-            if i >= len(abs_z_scores):
-                break
-            prefix = name.split("_")[0] if "_" in name else "Unknown"
-            if prefix not in subsystems:
-                subsystems[prefix] = []
-            subsystems[prefix].append(float(abs_z_scores[i]))
+        return result
 
-        return {
-            k: round(float(np.mean(v)), 3)
-            for k, v in subsystems.items()
-            if v
-        }
+    # ------------------------------------------------------------------
+    # Scenario injection
+    # ------------------------------------------------------------------
 
     def inject_scenario(self, scenario_type: str, scenario_data: np.ndarray) -> None:
-        """
-        Inject a synthetic scenario into the digital twin stream.
-
-        Args:
-            scenario_type: Type label (e.g., "attack", "sensor_failure")
-            scenario_data: Array of scenario samples (n_samples, n_features)
-        """
         self.active_scenario = scenario_type
-        self.scenario_data = scenario_data
-        self.scenario_idx = 0
+        self.scenario_data   = scenario_data
+        self.scenario_idx    = 0
         logger.info(f"Scenario injected: {scenario_type} ({len(scenario_data)} samples)")
 
     def stop_scenario(self) -> None:
-        """Stop the active scenario injection."""
         if self.active_scenario:
-            logger.info(f"Scenario stopped: {self.active_scenario}")
+            logger.info(f"Scenario ended: {self.active_scenario}")
         self.active_scenario = None
-        self.scenario_data = None
-        self.scenario_idx = 0
+        self.scenario_data   = None
+        self.scenario_idx    = 0
+
+    # ------------------------------------------------------------------
+    # State & persistence
+    # ------------------------------------------------------------------
 
     def get_state(self) -> Dict[str, Any]:
-        """Get current full state summary."""
+        trend = "stable"
+        if len(self.predict_history) >= 10:
+            rate = sum(list(self.predict_history)[-10:]) / 10
+            if   rate > 0.7: trend = "deteriorating"
+            elif rate < 0.2: trend = "recovering"
+
+        recent_scores = list(self.score_history)[-60:] if self.score_history else [0]
+
+        # Build model info block
+        models_active = []
+        if self._haiend_model   is not None: models_active.append("LSTM-haiend(225)")
+        if self._fallback_model is not None: models_active.append("LSTM-38feat")
+        if self._physics_models:             models_active.append("PhysicsResidual")
+        if self.anomaly_model   is not None: models_active.append("IsoForest")
+        models_active.append("Z-score")
+
         return {
             **self.state.to_dict(),
-            "health_score": self.health_score,
-            "alert_count": len(self.alert_log),
-            "active_scenario": self.active_scenario,
-            "history_length": len(self.history_buffer),
+            "health_score":          self.health_score,
+            "alert_count":           len(self.alert_log),
+            "active_scenario":       self.active_scenario,
+            "history_length":        len(self.history_buffer),
+            "trend":                 trend,
+            "avg_anomaly_score_1m":  round(float(np.mean(recent_scores)), 4),
+            "consecutive_anomalies": self.consecutive_anomalies,
+            "models_active":         models_active,
+            "primary_model_f1":      0.6874 if self._haiend_model is not None else None,
         }
 
     def get_alert_log(self) -> pd.DataFrame:
-        """Return alert log as DataFrame."""
         if not self.alert_log:
             return pd.DataFrame()
         return pd.DataFrame(self.alert_log)
 
     def reset_health(self) -> None:
-        """Reset health score and alerts."""
-        self.health_score = 100.0
-        self.state.health_score = 100.0
-        self.alert_log = []
-        self.alert_cooldowns = {}
-        logger.info("Digital Twin health and alerts reset")
+        self.health_score          = 100.0
+        self.consecutive_anomalies = 0
+        self.state.health_score    = 100.0
+        self.alert_log             = []
+        self.alert_cooldowns       = {}
+        self.score_history.clear()
+        self.predict_history.clear()
+        logger.info("Digital Twin reset")
 
     def save_state(self, path: str = None) -> str:
-        """Save current twin state and configuration."""
         save_path = path or str(self._outputs_dir / "digital_twin_state.json")
         state_data = {
             "config": {
-                "n_features": len(self.feature_names),
-                "feature_names": self.feature_names[:50],  # truncate for readability
+                "n_features":          len(self.feature_names),
+                "feature_names":       self.feature_names[:50],
                 "detection_threshold": self.detection_threshold,
+                "models_active":       self.get_state().get("models_active", []),
             },
             "baseline": {
                 "mean": self.baseline_mean.tolist()[:20] if self.baseline_mean is not None else None,
-                "std": self.baseline_std.tolist()[:20] if self.baseline_std is not None else None,
+                "std":  self.baseline_std.tolist()[:20]  if self.baseline_std  is not None else None,
             },
-            "health_score": self.health_score,
-            "total_alerts": len(self.alert_log),
-            "state": self.get_state(),
+            "health_score":  self.health_score,
+            "total_alerts":  len(self.alert_log),
+            "state":         self.get_state(),
+            "recent_alerts": self.alert_log[-10:],
         }
         with open(save_path, "w") as f:
             json.dump(state_data, f, indent=2, default=str)
         logger.info(f"Digital Twin state saved: {save_path}")
         return save_path
+
+    def _compute_subsystem_scores(self, abs_z_scores: np.ndarray) -> Dict[str, float]:
+        """Backward compat."""
+        return self.state._subsystem_scores()

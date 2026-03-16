@@ -137,6 +137,8 @@ def _load_label_files(data_dir: Path, info: dict) -> Optional[pd.DataFrame]:
     })
     labels["timestamp"] = pd.to_datetime(labels["timestamp"], format="mixed")
     labels = labels.set_index("timestamp")
+    # Drop duplicate timestamps (keep last), so .get() always returns a scalar
+    labels = labels[~labels.index.duplicated(keep="last")]
     return labels
 
 
@@ -234,10 +236,13 @@ class MultiVersionLoader:
             else:
                 if ext_labels is not None and isinstance(df.index, pd.DatetimeIndex):
                     # Align label series to data timestamps
-                    y_part = df.index.map(
-                        lambda ts: ext_labels["label"].get(ts, 0)
-                    ).astype(np.int8)
-                    y_part = pd.Series(y_part, index=df.index, dtype=np.int8)
+                    label_series = ext_labels["label"]
+                    y_vals = np.array(
+                        [int(label_series.at[ts]) if ts in label_series.index else 0
+                         for ts in df.index],
+                        dtype=np.int8,
+                    )
+                    y_part = pd.Series(y_vals, index=df.index)
                 else:
                     # Training files → all normal (no attack label files for train)
                     y_part = pd.Series(
