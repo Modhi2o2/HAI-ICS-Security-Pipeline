@@ -21,10 +21,10 @@ data/processed/*.csv
 data/processed/*.parquet
 data/processed/*.pkl
 
-# Large model binaries
-outputs/models/*.pt
-outputs/models/*.joblib
-outputs/models/*.pkl
+# Large model binaries — tracked (all files under 100MB GitHub limit)
+# outputs/models/*.pt
+# outputs/models/*.joblib
+# outputs/models/*.pkl
 outputs/synthetic/*.npy
 
 # Logs

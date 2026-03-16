@@ -1,9 +1,9 @@
 {
-  "total_samples": 250000,
+  "total_samples": 200000,
   "n_features": 38,
-  "n_normal": 248392,
-  "n_attack": 1608,
-  "attack_rate_pct": 0.6432,
+  "n_normal": 198721,
+  "n_attack": 1279,
+  "attack_rate_pct": 0.6395,
   "feature_names": [
     "P1_FCV01D",
     "P1_FCV01Z",
