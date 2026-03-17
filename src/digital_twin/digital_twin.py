@@ -1,19 +1,22 @@
 """
-HAI Digital Twin Module — v3  (multi-model, window-based scoring)
+HAI Digital Twin Module — v4  (multi-scale LSTM-AE)
 
 Detection layers (priority order):
-  Layer A  haiend LSTM-AE (225 sensors, window=30s)  — best model, F1=0.687
-  Layer B  38-feature LSTM-AE                         — fallback if haiend unavailable
-  Layer C  Physics residual (44 edges, Ridge)         — explainer + weak detector
-  Layer D  Z-score baseline deviation                 — always available
-  Layer E  Isolation Forest                           — unsupervised catch-all
+  Layer A  Multi-scale LSTM-AE (w=10+30+60, 225 sensors) — primary, fires if ANY scale fires
+        OR haiend single-scale LSTM-AE (w=30)            — if multiscale not available
+  Layer B  38-feature LSTM-AE                             — fallback if haiend unavailable
+  Layer C  Physics residual (44 edges, Ridge)             — explainer + weak detector
+  Layer D  Z-score baseline deviation                     — always available
+  Layer E  Isolation Forest                               — unsupervised catch-all
+
+Multi-scale rationale:
+  w=10s  catches short attacks (< 30s) that single-scale w=30 misses
+  w=30s  existing best model (F1=0.6886)
+  w=60s  catches slow-drift attacks building over a minute
 
 Each layer contributes a normalised [0,1] score.
 Final score = weighted average of available layers.
 Confidence = number of independent layers that fired.
-
-Key change from v2: haiend LSTM needs a rolling (W=30, N=225) window tensor,
-not a flat single-sample vector.  Physics residual uses lagged lag buffers.
 """
 
 import sys
@@ -158,7 +161,31 @@ class DigitalTwin:
         self.baseline_mean: Optional[np.ndarray] = None
         self.baseline_std:  Optional[np.ndarray] = None
 
-        # ── Layer A: haiend LSTM-AE ──────────────────────────────────────────
+        # ── Layer A (top priority): LSTM-VAE ────────────────────────────────
+        self._vae_model          = None        # LSTMVariationalAutoencoder
+        self._vae_pkg            = None        # full pkg
+        self._vae_n_features     = 225
+        self._vae_window         = 30
+        self._vae_mean           = None
+        self._vae_std            = None
+        self._vae_threshold      = None        # threshold for best_score_type
+        self._vae_score_type     = "elbo"      # mse / kl / elbo / mu_mag
+        self._vae_buffer         = deque(maxlen=30)
+        self._vae_score_buf      = deque(maxlen=600)
+        self._vae_last_raw: float = 0.0
+        self._vae_per_sensor     = None        # (225,) last per-sensor MSE
+
+        # ── Layer A: Multi-scale LSTM-AE (w=10+30+60) ───────────────────────
+        self._ms_pkg             = None        # full multiscale joblib pkg
+        self._ms_models: Dict[int, Any] = {}   # window -> LSTMAutoencoder
+        self._ms_thresholds: Dict[int, float] = {}  # window -> raw MSE threshold
+        self._ms_buffers: Dict[int, deque] = {} # window -> deque rolling buffer
+        self._ms_score_bufs: Dict[int, deque] = {}  # window -> deque score history
+        self._ms_n_features  = 225
+        self._ms_mean        = None            # shared (225,) float32
+        self._ms_std         = None            # shared (225,) float32
+
+        # ── Layer A fallback: single-scale haiend LSTM-AE (w=30) ────────────
         self._haiend_model       = None        # LSTMAutoencoder object
         self._haiend_n_features  = 225
         self._haiend_window      = 30
@@ -260,46 +287,134 @@ class DigitalTwin:
         model_dir = Path(model_dir)
         loaded_primary = False
 
-        # ── Layer A: haiend LSTM-AE ──────────────────────────────────────────
-        for fname in ["haiend_lstm_detection.joblib", "best_detection_model.joblib"]:
-            path = model_dir / fname
-            if not path.exists():
-                continue
+        # ── Layer A (top priority): LSTM-VAE — only if it beats LSTM-AE ────────
+        # VAE trained 2026-03-17: best score=MSE, F1=0.6700 < 0.6886 baseline
+        # Auto-load disabled until a VAE configuration exceeds the LSTM-AE F1
+        vae_path = model_dir / "lstm_vae_detection.joblib"
+        if vae_path.exists():
             try:
-                # Must patch __main__ before loading (model class was saved from __main__)
-                from train_haiend_lstm import LSTMAutoencoder as _LSTmHaiend
-                sys.modules["__main__"].LSTMAutoencoder = _LSTmHaiend
-
-                pkg = joblib.load(path)
-                if not isinstance(pkg, dict):
-                    continue
-                if pkg.get("model_type") != "LSTMAutoencoder_haiend":
-                    continue
-
-                self._haiend_model      = pkg["model"]
-                self._haiend_model.eval()
-                self._haiend_n_features = int(pkg.get("n_features", 225))
-                self._haiend_window     = int(pkg.get("window", 30))
-                self._haiend_mean       = pkg["data_mean"].astype(np.float32)
-                self._haiend_std        = pkg["data_std"].astype(np.float32)
-                self._haiend_threshold  = float(pkg.get("threshold", 0.01))
-                self._haiend_buffer     = deque(maxlen=self._haiend_window)
-                self._haiend_columns    = pkg.get("columns", [])
-
-                # Keep backward-compat attributes pointing to haiend model
-                self.detection_model      = self._haiend_model
-                self.detection_model_type = "lstm_haiend"
-                self.detection_threshold  = self._haiend_threshold
-
-                logger.info(
-                    f"[Layer A] haiend LSTM-AE loaded: {path.name}  "
-                    f"n_feat={self._haiend_n_features}  window={self._haiend_window}  "
-                    f"F1={pkg.get('best_f1', 0):.4f}"
-                )
-                loaded_primary = True
-                break
+                from train_lstm_vae import LSTMVariationalAutoencoder as _VAE
+                sys.modules["__main__"].LSTMVariationalAutoencoder = _VAE
+                vae_pkg = joblib.load(vae_path)
+                if isinstance(vae_pkg, dict) and \
+                   vae_pkg.get("model_type") == "LSTMVariationalAutoencoder_haiend":
+                    vae_f1 = vae_pkg.get("best_f1", 0.0)
+                    # Only use VAE if it actually beats the LSTM-AE baseline
+                    if vae_f1 > 0.6886:
+                        self._vae_pkg         = vae_pkg
+                        self._vae_model       = vae_pkg["model"]
+                        self._vae_model.eval()
+                        self._vae_n_features  = int(vae_pkg.get("n_features", 225))
+                        self._vae_window      = int(vae_pkg.get("window", 30))
+                        self._vae_mean        = vae_pkg["data_mean"].astype(np.float32)
+                        self._vae_std         = vae_pkg["data_std"].astype(np.float32)
+                        self._vae_threshold   = float(vae_pkg.get("threshold", 0.01))
+                        self._vae_score_type  = vae_pkg.get("best_score_type", "elbo")
+                        self._vae_buffer      = deque(maxlen=self._vae_window)
+                        self._haiend_model      = self._vae_model
+                        self._haiend_mean       = self._vae_mean
+                        self._haiend_std        = self._vae_std
+                        self._haiend_threshold  = self._vae_threshold
+                        self._haiend_n_features = self._vae_n_features
+                        self._haiend_window     = self._vae_window
+                        self._haiend_buffer     = deque(maxlen=self._vae_window)
+                        self.detection_model      = self._vae_model
+                        self.detection_model_type = "lstm_vae"
+                        self.detection_threshold  = self._vae_threshold
+                        logger.info(
+                            f"[Layer A] LSTM-VAE loaded: score={self._vae_score_type}  "
+                            f"F1={vae_f1:.4f}  (beats baseline)"
+                        )
+                        loaded_primary = True
+                    else:
+                        logger.info(
+                            f"[Layer A] LSTM-VAE skipped: F1={vae_f1:.4f} < 0.6886 baseline"
+                        )
             except Exception as e:
-                logger.warning(f"Could not load haiend LSTM from {path}: {e}")
+                logger.warning(f"Could not load LSTM-VAE from {vae_path}: {e}")
+
+        # ── Layer A (2nd priority): Multi-scale LSTM-AE (w=10+30+60) ────────
+        if not loaded_primary:
+            ms_path = model_dir / "multiscale_lstm_detection.joblib"
+            if ms_path.exists():
+                try:
+                    from train_haiend_lstm import LSTMAutoencoder as _LSTMMs
+                    sys.modules["__main__"].LSTMAutoencoder = _LSTMMs
+
+                    ms_pkg = joblib.load(ms_path)
+                    if isinstance(ms_pkg, dict) and ms_pkg.get("model_type") == "MultiScale_LSTMAe_haiend":
+                        self._ms_pkg        = ms_pkg
+                        self._ms_models     = ms_pkg["models"]
+                        self._ms_thresholds = ms_pkg["thresholds"]
+                        self._ms_mean       = ms_pkg["data_mean"].astype(np.float32)
+                        self._ms_std        = ms_pkg["data_std"].astype(np.float32)
+                        self._ms_n_features = int(ms_pkg.get("n_features", 225))
+
+                        for w, mdl in self._ms_models.items():
+                            mdl.eval()
+                            self._ms_buffers[w]    = deque(maxlen=w)
+                            self._ms_score_bufs[w] = deque(maxlen=600)
+
+                        if 30 in self._ms_models:
+                            self._haiend_model      = self._ms_models[30]
+                            self._haiend_mean       = self._ms_mean
+                            self._haiend_std        = self._ms_std
+                            self._haiend_threshold  = self._ms_thresholds.get(30, 0.01)
+                            self._haiend_n_features = self._ms_n_features
+                            self._haiend_window     = 30
+                            self._haiend_buffer     = deque(maxlen=30)
+                            self.detection_model      = self._haiend_model
+                            self.detection_model_type = "lstm_multiscale"
+                            self.detection_threshold  = self._haiend_threshold
+
+                        best_f1 = ms_pkg.get("best_ensemble_f1", ms_pkg.get("w30_baseline_f1", 0))
+                        logger.info(
+                            f"[Layer A] Multi-scale LSTM-AE: scales={sorted(self._ms_models.keys())}  "
+                            f"n_feat={self._ms_n_features}  best_F1={best_f1:.4f}"
+                        )
+                        loaded_primary = True
+                except Exception as e:
+                    logger.warning(f"Could not load multiscale LSTM from {ms_path}: {e}")
+
+        # ── Layer A fallback: single-scale haiend LSTM-AE (w=30) ────────────
+        if not loaded_primary:
+            for fname in ["haiend_lstm_detection.joblib", "best_detection_model.joblib"]:
+                path = model_dir / fname
+                if not path.exists():
+                    continue
+                try:
+                    from train_haiend_lstm import LSTMAutoencoder as _LSTmHaiend
+                    sys.modules["__main__"].LSTMAutoencoder = _LSTmHaiend
+
+                    pkg = joblib.load(path)
+                    if not isinstance(pkg, dict):
+                        continue
+                    if pkg.get("model_type") != "LSTMAutoencoder_haiend":
+                        continue
+
+                    self._haiend_model      = pkg["model"]
+                    self._haiend_model.eval()
+                    self._haiend_n_features = int(pkg.get("n_features", 225))
+                    self._haiend_window     = int(pkg.get("window", 30))
+                    self._haiend_mean       = pkg["data_mean"].astype(np.float32)
+                    self._haiend_std        = pkg["data_std"].astype(np.float32)
+                    self._haiend_threshold  = float(pkg.get("threshold", 0.01))
+                    self._haiend_buffer     = deque(maxlen=self._haiend_window)
+                    self._haiend_columns    = pkg.get("columns", [])
+
+                    self.detection_model      = self._haiend_model
+                    self.detection_model_type = "lstm_haiend"
+                    self.detection_threshold  = self._haiend_threshold
+
+                    logger.info(
+                        f"[Layer A] haiend LSTM-AE loaded: {path.name}  "
+                        f"n_feat={self._haiend_n_features}  window={self._haiend_window}  "
+                        f"F1={pkg.get('best_f1', 0):.4f}"
+                    )
+                    loaded_primary = True
+                    break
+                except Exception as e:
+                    logger.warning(f"Could not load haiend LSTM from {path}: {e}")
 
         # ── Layer B: 38-feature LSTM-AE fallback ────────────────────────────
         for fname in ["lstm_ae_detection.joblib"]:
@@ -424,7 +539,163 @@ class DigitalTwin:
         return pd.DataFrame(results)
 
     # ------------------------------------------------------------------
-    # Layer A — haiend LSTM-AE (window-based)
+    # Layer A — LSTM-VAE (probabilistic latent space)
+    # ------------------------------------------------------------------
+
+    def _lstm_vae_score(self, sample: np.ndarray
+                        ) -> Tuple[float, Optional[np.ndarray], bool]:
+        """
+        Score using LSTM-VAE. Anomaly signal = best_score_type from training.
+
+        Returns
+        -------
+        norm_score  : float  0-1 (normalised by running p97, for display)
+        per_sensor  : ndarray (225,) per-sensor MSE from reconstruction
+        above_thr   : bool   score >= pre-calibrated threshold
+        """
+        try:
+            import torch
+            N = self._vae_n_features
+            W = self._vae_window
+
+            n_in = len(sample)
+            vec  = sample[:N].astype(np.float32) if n_in >= N else \
+                   np.pad(sample.astype(np.float32), (0, N - n_in))
+
+            self._vae_buffer.append(vec)
+            buf = list(self._vae_buffer)
+            if len(buf) < W:
+                buf = [np.zeros(N, dtype=np.float32)] * (W - len(buf)) + buf
+            window_arr  = np.array(buf[-W:], dtype=np.float32)
+            window_norm = (window_arr - self._vae_mean) / self._vae_std
+
+            x = torch.from_numpy(window_norm[np.newaxis])   # (1, W, N)
+            self._vae_model.eval()
+
+            score_type = self._vae_score_type
+            if score_type == "kl":
+                raw_score = float(self._vae_model.kl_score(x)[0])
+            elif score_type == "elbo":
+                raw_score = float(self._vae_model.elbo_score(x, beta=1.0)[0])
+            elif score_type == "mu_mag":
+                raw_score = float(self._vae_model.mu_magnitude(x)[0])
+            else:  # mse
+                raw_score = float(self._vae_model.reconstruction_error(x)[0])
+
+            # Per-sensor MSE for root cause
+            per_sensor = self._vae_model.per_sensor_error(x)[0]  # (N,)
+            self._vae_per_sensor     = per_sensor
+            self._haiend_per_sensor  = per_sensor  # expose for root cause analysis
+            self._vae_last_raw       = raw_score
+            self._haiend_last_raw    = raw_score
+
+            self._vae_score_buf.append(raw_score)
+            self._haiend_score_buf.append(raw_score)
+
+            above_thr = raw_score >= self._vae_threshold
+
+            # Running p97 for display
+            if len(self._vae_score_buf) >= 20:
+                p97 = float(np.percentile(list(self._vae_score_buf), 97))
+            else:
+                p97 = max(self._vae_threshold * 3.0, 1e-6)
+            norm_score = float(np.clip(raw_score / (p97 + 1e-8), 0.0, 2.0))
+
+            return norm_score, per_sensor, above_thr
+
+        except Exception as e:
+            logger.debug(f"VAE score error: {e}")
+            return 0.0, None, False
+
+    # ------------------------------------------------------------------
+    # Layer A — Multi-scale LSTM-AE (w=10 + w=30 + w=60)
+    # ------------------------------------------------------------------
+
+    def _lstm_multiscale_score(self, sample: np.ndarray
+                               ) -> Tuple[float, Optional[np.ndarray], bool]:
+        """
+        Score using all 3 scales. Returns aggregate norm score, w=30 per-sensor
+        errors (for root cause), and fired=True if ANY scale fires.
+
+        Returns
+        -------
+        norm_score  : float  max of normalised scores across scales (display)
+        per_sensor  : ndarray (225,) from w=30 (most interpretable)
+        fired       : bool   True if any scale's raw MSE >= its threshold
+        """
+        try:
+            import torch
+            N = self._ms_n_features
+
+            # Align sample to N features
+            n_in = len(sample)
+            if n_in >= N:
+                vec = sample[:N].astype(np.float32)
+            else:
+                vec = np.zeros(N, dtype=np.float32)
+                vec[:n_in] = sample[:n_in].astype(np.float32)
+
+            per_sensor_w30 = None
+            norm_scores    = {}
+            scale_fired    = {}
+
+            for w, model in self._ms_models.items():
+                buf = self._ms_buffers[w]
+                buf.append(vec)
+
+                # Build padded window
+                buf_list = list(buf)
+                if len(buf_list) < w:
+                    pad      = [np.zeros(N, dtype=np.float32)] * (w - len(buf_list))
+                    buf_list = pad + buf_list
+                window_arr  = np.array(buf_list[-w:], dtype=np.float32)   # (W, N)
+                window_norm = (window_arr - self._ms_mean) / self._ms_std
+
+                x = torch.from_numpy(window_norm[np.newaxis])             # (1, W, N)
+                model.eval()
+                with torch.no_grad():
+                    recon      = model(x)                                  # (1, W, N)
+                    sq_err     = (x - recon) ** 2                          # (1, W, N)
+                    per_sensor = sq_err.mean(dim=1).squeeze(0).cpu().numpy()  # (N,)
+                    raw_score  = float(per_sensor.mean())
+
+                self._ms_score_bufs[w].append(raw_score)
+
+                # Fire decision: pre-calibrated absolute threshold
+                thr = self._ms_thresholds.get(w, 0.01)
+                scale_fired[w] = raw_score >= thr
+
+                # Running p97 normalisation for display
+                sbuf = self._ms_score_bufs[w]
+                if len(sbuf) >= 20:
+                    p97 = float(np.percentile(list(sbuf), 97))
+                else:
+                    p97 = max(thr * 3.0, 1e-6)
+                norm_scores[w] = float(np.clip(raw_score / (p97 + 1e-8), 0.0, 2.0))
+
+                if w == 30:
+                    per_sensor_w30           = per_sensor
+                    self._haiend_per_sensor  = per_sensor
+                    self._haiend_last_raw    = raw_score
+                    self._haiend_score_buf.append(raw_score)
+
+            # Decision: use w=30 threshold only (OR logic adds FP faster than it reduces FN)
+            # w=10 and w=60 contribute only to the display score
+            fired      = scale_fired.get(30, False)
+            norm_score = float(max(norm_scores.values())) if norm_scores else 0.0
+
+            fired_scales = [w for w, f in scale_fired.items() if f]
+            if fired_scales:
+                logger.debug(f"Multi-scale fired: {fired_scales}")
+
+            return norm_score, per_sensor_w30, fired
+
+        except Exception as e:
+            logger.debug(f"Multiscale LSTM score error: {e}")
+            return 0.0, None, False
+
+    # ------------------------------------------------------------------
+    # Layer A fallback — single-scale haiend LSTM-AE (window-based)
     # ------------------------------------------------------------------
 
     def _lstm_haiend_score(self, sample: np.ndarray
@@ -645,13 +916,26 @@ class DigitalTwin:
         weights:      Dict[str, float] = {}
         layers_fired: List[str]        = []
 
-        # Layer A — haiend LSTM-AE
-        if self._haiend_model is not None:
+        # Layer A — VAE (top priority) → Multi-scale → Single-scale haiend
+        if self._vae_model is not None:
+            ns, _per, above = self._lstm_vae_score(sample)
+            scores["lstm_haiend"]     = ns
+            scores["lstm_haiend_raw"] = getattr(self, "_vae_last_raw", 0.0)
+            weights["lstm_haiend"]    = _W_LSTM_HAIEND
+            if above:
+                layers_fired.append("LSTM-haiend")
+        elif self._ms_pkg is not None and self._ms_models:
+            ns, _per, fired = self._lstm_multiscale_score(sample)
+            scores["lstm_haiend"]     = ns
+            scores["lstm_haiend_raw"] = getattr(self, "_haiend_last_raw", 0.0)
+            weights["lstm_haiend"]    = _W_LSTM_HAIEND
+            if fired:
+                layers_fired.append("LSTM-haiend")
+        elif self._haiend_model is not None:
             ns, _per, above = self._lstm_haiend_score(sample)
             scores["lstm_haiend"]     = ns
             scores["lstm_haiend_raw"] = getattr(self, "_haiend_last_raw", 0.0)
             weights["lstm_haiend"]    = _W_LSTM_HAIEND
-            # Fire on pre-calibrated absolute threshold (gives same F1 as batch mode)
             if above:
                 layers_fired.append("LSTM-haiend")
 
@@ -938,7 +1222,13 @@ class DigitalTwin:
 
         # Build model info block
         models_active = []
-        if self._haiend_model   is not None: models_active.append("LSTM-haiend(225)")
+        if self._vae_model is not None:
+            models_active.append(f"LSTM-VAE(score={self._vae_score_type})")
+        elif self._ms_pkg is not None and self._ms_models:
+            scales = sorted(self._ms_models.keys())
+            models_active.append(f"LSTM-MultiScale(w={'|'.join(str(s) for s in scales)})")
+        elif self._haiend_model is not None:
+            models_active.append("LSTM-haiend(225)")
         if self._fallback_model is not None: models_active.append("LSTM-38feat")
         if self._physics_models:             models_active.append("PhysicsResidual")
         if self.anomaly_model   is not None: models_active.append("IsoForest")
@@ -954,7 +1244,11 @@ class DigitalTwin:
             "avg_anomaly_score_1m":  round(float(np.mean(recent_scores)), 4),
             "consecutive_anomalies": self.consecutive_anomalies,
             "models_active":         models_active,
-            "primary_model_f1":      0.6874 if self._haiend_model is not None else None,
+            "primary_model_f1":      (
+                self._vae_pkg.get("best_f1", 0.6874) if self._vae_pkg
+                else (self._ms_pkg.get("best_ensemble_f1", 0.6874) if self._ms_pkg
+                      else (0.6874 if self._haiend_model is not None else None))
+            ),
         }
 
     def get_alert_log(self) -> pd.DataFrame:
