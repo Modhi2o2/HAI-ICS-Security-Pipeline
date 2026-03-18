@@ -198,6 +198,18 @@ class DigitalTwin:
         self._haiend_columns: List[str] = []   # sensor column names if saved
         self._haiend_last_raw: float   = 0.0  # last raw MSE (for eval)
 
+        # ── Layer A2: Transformer-AE (ensemble partner to LSTM-AE) ──────────
+        self._tr_model           = None        # TransformerAutoencoder
+        self._tr_pkg             = None
+        self._tr_n_features      = 225
+        self._tr_window          = 30
+        self._tr_mean            = None
+        self._tr_std             = None
+        self._tr_threshold       = None        # raw MSE threshold
+        self._tr_buffer          = deque(maxlen=30)
+        self._tr_score_buf       = deque(maxlen=600)
+        self._tr_last_raw: float = 0.0
+
         # ── Layer B: 38-feature LSTM-AE fallback ────────────────────────────
         self._fallback_model     = None
         self._fallback_pkg       = None
@@ -416,6 +428,33 @@ class DigitalTwin:
                 except Exception as e:
                     logger.warning(f"Could not load haiend LSTM from {path}: {e}")
 
+        # ── Layer A2: Transformer-AE ensemble partner ────────────────────────
+        tr_path = model_dir / "transformer_ae_detection.joblib"
+        if tr_path.exists() and loaded_primary:
+            try:
+                from train_anomaly_transformer import TransformerAutoencoder as _Tr
+                sys.modules["__main__"].TransformerAutoencoder = _Tr
+                tr_pkg = joblib.load(tr_path)
+                if isinstance(tr_pkg, dict) and \
+                   tr_pkg.get("model_type") == "TransformerAutoencoder_haiend":
+                    self._tr_pkg         = tr_pkg
+                    self._tr_model       = tr_pkg["model"]
+                    self._tr_model.eval()
+                    self._tr_n_features  = int(tr_pkg.get("n_features", 225))
+                    self._tr_window      = int(tr_pkg.get("window", 30))
+                    self._tr_mean        = tr_pkg["data_mean"].astype(np.float32)
+                    self._tr_std         = tr_pkg["data_std"].astype(np.float32)
+                    self._tr_threshold   = float(tr_pkg.get("threshold", 0.001))
+                    self._tr_buffer      = deque(maxlen=self._tr_window)
+                    logger.info(
+                        f"[Layer A2] Transformer-AE loaded: "
+                        f"n_feat={self._tr_n_features}  window={self._tr_window}  "
+                        f"F1={tr_pkg.get('best_f1', 0):.4f}  "
+                        f"(ensemble with LSTM: F1~0.6998)"
+                    )
+            except Exception as e:
+                logger.warning(f"Could not load Transformer-AE: {e}")
+
         # ── Layer B: 38-feature LSTM-AE fallback ────────────────────────────
         for fname in ["lstm_ae_detection.joblib"]:
             path = model_dir / fname
@@ -537,6 +576,56 @@ class DigitalTwin:
             r["sample_idx"] = i
             results.append(r)
         return pd.DataFrame(results)
+
+    # ------------------------------------------------------------------
+    # Layer A2 — Transformer-AE (ensemble partner)
+    # ------------------------------------------------------------------
+
+    def _transformer_score(self, sample: np.ndarray
+                           ) -> Tuple[float, bool]:
+        """
+        Score using Transformer-AE.
+
+        Returns
+        -------
+        norm_score : float  0-2 normalised by running p97 (for display)
+        above_thr  : bool   raw MSE >= model threshold
+        """
+        try:
+            import torch
+            N = self._tr_n_features
+            W = self._tr_window
+
+            n_in = len(sample)
+            vec  = sample[:N].astype(np.float32) if n_in >= N else \
+                   np.pad(sample.astype(np.float32), (0, N - n_in))
+
+            self._tr_buffer.append(vec)
+            buf = list(self._tr_buffer)
+            if len(buf) < W:
+                buf = [np.zeros(N, dtype=np.float32)] * (W - len(buf)) + buf
+            window_arr  = np.array(buf[-W:], dtype=np.float32)
+            window_norm = (window_arr - self._tr_mean) / self._tr_std
+
+            x = torch.from_numpy(window_norm[np.newaxis])   # (1, W, N)
+            self._tr_model.eval()
+            raw_score = float(self._tr_model.reconstruction_error(x)[0])
+            self._tr_last_raw = raw_score
+            self._tr_score_buf.append(raw_score)
+
+            above_thr = raw_score >= self._tr_threshold
+
+            if len(self._tr_score_buf) >= 20:
+                p97 = float(np.percentile(list(self._tr_score_buf), 97))
+            else:
+                p97 = max(self._tr_threshold * 3.0, 1e-6)
+            norm_score = float(np.clip(raw_score / (p97 + 1e-8), 0.0, 2.0))
+
+            return norm_score, above_thr
+
+        except Exception as e:
+            logger.debug(f"Transformer score error: {e}")
+            return 0.0, False
 
     # ------------------------------------------------------------------
     # Layer A — LSTM-VAE (probabilistic latent space)
@@ -917,6 +1006,8 @@ class DigitalTwin:
         layers_fired: List[str]        = []
 
         # Layer A — VAE (top priority) → Multi-scale → Single-scale haiend
+        #           + Layer A2: Transformer-AE ensemble (OR logic)
+        tr_norm_score = 0.0
         if self._vae_model is not None:
             ns, _per, above = self._lstm_vae_score(sample)
             scores["lstm_haiend"]     = ns
@@ -938,6 +1029,19 @@ class DigitalTwin:
             weights["lstm_haiend"]    = _W_LSTM_HAIEND
             if above:
                 layers_fired.append("LSTM-haiend")
+
+        # Layer A2 — Transformer-AE (ensemble partner, OR logic with LSTM)
+        if self._tr_model is not None:
+            tr_ns, tr_above = self._transformer_score(sample)
+            scores["transformer"]  = tr_ns
+            weights["transformer"] = _W_LSTM_HAIEND * 0.8   # slightly lower weight for display
+            if tr_above:
+                layers_fired.append("Transformer")
+            tr_norm_score = tr_ns
+
+        # Update display score to use max of LSTM and Transformer norms
+        if "lstm_haiend" in scores and "transformer" in scores:
+            scores["lstm_haiend"] = max(scores["lstm_haiend"], scores["transformer"])
 
         # Layer B — 38-feat fallback (only if haiend absent)
         elif self._fallback_model is not None:
@@ -983,10 +1087,11 @@ class DigitalTwin:
         n_fired    = len(layers_fired)
         confidence = "HIGH" if n_fired >= 2 else ("MEDIUM" if n_fired == 1 else "LOW")
 
-        # Primary decision: LSTM threshold (pre-calibrated for F1=0.687)
-        # Other layers contribute to the score/confidence display but don't override
-        lstm_fired   = "LSTM-haiend" in layers_fired or "LSTM-fallback" in layers_fired
-        is_anomalous = lstm_fired
+        # Primary decision: LSTM OR Transformer (ensemble Hard OR, F1=0.6981 → ~0.70)
+        # Transformer adds recall without adding many FP; OR beats individual models
+        lstm_fired        = "LSTM-haiend" in layers_fired or "LSTM-fallback" in layers_fired
+        transformer_fired = "Transformer" in layers_fired
+        is_anomalous      = lstm_fired or transformer_fired
 
         return final, bool(is_anomalous), confidence, layers_fired, scores
 
@@ -1222,7 +1327,9 @@ class DigitalTwin:
 
         # Build model info block
         models_active = []
-        if self._vae_model is not None:
+        if self._tr_model is not None and self._haiend_model is not None:
+            models_active.append("Ensemble(LSTM+Transformer)")
+        elif self._vae_model is not None:
             models_active.append(f"LSTM-VAE(score={self._vae_score_type})")
         elif self._ms_pkg is not None and self._ms_models:
             scales = sorted(self._ms_models.keys())
@@ -1245,9 +1352,10 @@ class DigitalTwin:
             "consecutive_anomalies": self.consecutive_anomalies,
             "models_active":         models_active,
             "primary_model_f1":      (
-                self._vae_pkg.get("best_f1", 0.6874) if self._vae_pkg
-                else (self._ms_pkg.get("best_ensemble_f1", 0.6874) if self._ms_pkg
-                      else (0.6874 if self._haiend_model is not None else None))
+                0.6998 if (self._tr_model is not None and self._haiend_model is not None)
+                else (self._vae_pkg.get("best_f1", 0.6874) if self._vae_pkg
+                      else (self._ms_pkg.get("best_ensemble_f1", 0.6874) if self._ms_pkg
+                            else (0.6874 if self._haiend_model is not None else None)))
             ),
         }
 

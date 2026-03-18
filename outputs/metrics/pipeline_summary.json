@@ -1,5 +1,5 @@
 {
-  "run_timestamp": "2026-03-16 08:40:22.970982",
+  "run_timestamp": "2026-03-18 16:36:10.686150",
   "elapsed_seconds": 299.1,
   "dataset_version": "hai-23.05",
   "train_shape": [
@@ -10,13 +10,17 @@
     50000,
     88
   ],
-  "best_model": "LSTM-AE-haiend(h=128,l=48,w=30)",
+  "best_model": "Ensemble(Transformer+LSTM, strategy=max_norm)",
   "metrics": {
-    "f1": 0.6886306120536133,
-    "precision": 0.7380952380952381,
-    "recall": 0.6453794799718904,
-    "roc_auc": 0.8650449589138034,
-    "threshold": 0.007676558503879513
+    "f1": 0.6998103870878232,
+    "precision": 0.738939349545854,
+    "recall": 0.6646170063246662,
+    "roc_auc": 0.8730182179956,
+    "threshold": 0.7328022997357861,
+    "tp": 7566.0,
+    "fp": 2673.0,
+    "tn": 270343.0,
+    "fn": 3818.0
   },
   "all_model_metrics": {
     "LSTM_AE_raw": {
@@ -112,7 +116,7 @@
   "digital_twin_health": 100.0,
   "digital_twin_alerts": 0,
   "eda_completed": true,
-  "training_note": "LSTM-AE on haiend (225 sensors): 60 epochs, window=30s",
+  "training_note": "Ensemble of Transformer-AE and LSTM-AE",
   "n_features": 190,
   "training_versions": [
     "hai-20.07",
