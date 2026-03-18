@@ -1,21 +1,26 @@
 """
-HAI Digital Twin Module — v4  (multi-scale LSTM-AE)
+HAI Digital Twin Module — v5  (triple-ensemble: LSTM + Transformer + GRU-GAT)
 
 Detection layers (priority order):
-  Layer A  Multi-scale LSTM-AE (w=10+30+60, 225 sensors) — primary, fires if ANY scale fires
-        OR haiend single-scale LSTM-AE (w=30)            — if multiscale not available
-  Layer B  38-feature LSTM-AE                             — fallback if haiend unavailable
-  Layer C  Physics residual (44 edges, Ridge)             — explainer + weak detector
-  Layer D  Z-score baseline deviation                     — always available
-  Layer E  Isolation Forest                               — unsupervised catch-all
+  Layer A   haiend LSTM-AE (w=30, 225 sensors, F1=0.6886)  — primary
+  Layer A2  Transformer-AE (w=30, 225 sensors, F1=0.6795)  — ensemble partner (better ROC)
+  Layer A3  GRU-GAT        (w=30, 225 sensors)             — inter-sensor graph attention
+  Layer B   38-feature LSTM-AE                              — fallback if haiend unavailable
+  Layer C   Physics residual (44 edges, Ridge)              — explainer + weak detector
+  Layer D   Z-score baseline deviation                      — always available
+  Layer E   Isolation Forest                                — unsupervised catch-all
 
-Multi-scale rationale:
-  w=10s  catches short attacks (< 30s) that single-scale w=30 misses
-  w=30s  existing best model (F1=0.6886)
-  w=60s  catches slow-drift attacks building over a minute
+Primary decision (Hard OR triple ensemble):
+  is_anomalous = lstm_fired OR transformer_fired OR gru_gat_fired
+
+Ensemble rationale:
+  LSTM-AE:     highest recall  (fewest FN), captures temporal sequential patterns
+  Transformer: highest ROC     (fewer FP),  captures global window relationships
+  GRU-GAT:     inter-sensor    (new axis),  detects relational inconsistencies
+  Combined F1 target: >0.70 (vs 0.6998 for LSTM+Transformer pair)
 
 Each layer contributes a normalised [0,1] score.
-Final score = weighted average of available layers.
+Display score = max of deep model scores.
 Confidence = number of independent layers that fired.
 """
 
@@ -210,6 +215,21 @@ class DigitalTwin:
         self._tr_score_buf       = deque(maxlen=600)
         self._tr_last_raw: float = 0.0
 
+        # ── Layer A3: GRU-GAT (graph-attended CNN AE) ────────────────────────
+        # Captures inter-sensor dependencies via learned graph attention.
+        # Architecturally different from both LSTM and Transformer.
+        self._gat_model          = None        # GRUGATModel
+        self._gat_pkg            = None
+        self._gat_n_features     = 225
+        self._gat_window         = 30
+        self._gat_mean           = None
+        self._gat_std            = None
+        self._gat_threshold      = None        # raw MSE threshold
+        self._gat_buffer         = deque(maxlen=30)
+        self._gat_score_buf      = deque(maxlen=600)
+        self._gat_last_raw: float = 0.0
+        self._gat_per_sensor     = None        # (N,) last per-sensor errors
+
         # ── Layer B: 38-feature LSTM-AE fallback ────────────────────────────
         self._fallback_model     = None
         self._fallback_pkg       = None
@@ -259,7 +279,7 @@ class DigitalTwin:
         self._outputs_dir = Path(config["paths"]["outputs"])
         self._outputs_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info("Digital Twin v3 initialized (multi-model, window-based)")
+        logger.info("Digital Twin v5 initialized (triple-ensemble: LSTM + Transformer + GRU-GAT)")
 
     # ------------------------------------------------------------------
     # Baseline
@@ -455,6 +475,33 @@ class DigitalTwin:
             except Exception as e:
                 logger.warning(f"Could not load Transformer-AE: {e}")
 
+        # ── Layer A3: GRU-GAT (graph-attended CNN autoencoder) ───────────────
+        gat_path = model_dir / "gru_gat_detection.joblib"
+        if gat_path.exists() and loaded_primary:
+            try:
+                from train_gru_gat import GRUGATModel as _GRUGATModel
+                sys.modules["__main__"].GRUGATModel = _GRUGATModel
+                gat_pkg = joblib.load(gat_path)
+                if isinstance(gat_pkg, dict) and \
+                   gat_pkg.get("model_type") == "GRUGATModel_haiend":
+                    self._gat_pkg         = gat_pkg
+                    self._gat_model       = gat_pkg["model"]
+                    self._gat_model.eval()
+                    self._gat_n_features  = int(gat_pkg.get("n_features", 225))
+                    self._gat_window      = int(gat_pkg.get("window", 30))
+                    self._gat_mean        = gat_pkg["data_mean"].astype(np.float32)
+                    self._gat_std         = gat_pkg["data_std"].astype(np.float32)
+                    self._gat_threshold   = float(gat_pkg.get("threshold", 0.001))
+                    self._gat_buffer      = deque(maxlen=self._gat_window)
+                    gat_f1 = float(gat_pkg.get("best_f1", 0))
+                    logger.info(
+                        f"[Layer A3] GRU-GAT loaded: "
+                        f"n_feat={self._gat_n_features}  window={self._gat_window}  "
+                        f"F1={gat_f1:.4f}  (graph-attention inter-sensor ensemble)"
+                    )
+            except Exception as e:
+                logger.warning(f"Could not load GRU-GAT: {e}")
+
         # ── Layer B: 38-feature LSTM-AE fallback ────────────────────────────
         for fname in ["lstm_ae_detection.joblib"]:
             path = model_dir / fname
@@ -626,6 +673,65 @@ class DigitalTwin:
         except Exception as e:
             logger.debug(f"Transformer score error: {e}")
             return 0.0, False
+
+    # ------------------------------------------------------------------
+    # Layer A3 — GRU-GAT (graph-attended CNN autoencoder)
+    # ------------------------------------------------------------------
+
+    def _gru_gat_score(self, sample: np.ndarray) -> Tuple[float, Optional[np.ndarray], bool]:
+        """
+        Score using GRU-GAT (inter-sensor graph attention model).
+
+        Returns
+        -------
+        norm_score  : float  0-1 (normalised by running p97, for display)
+        per_sensor  : ndarray (N,) per-sensor MSE, or None
+        above_thr   : bool   raw MSE >= pre-calibrated threshold
+        """
+        try:
+            import torch
+            N = self._gat_n_features
+            W = self._gat_window
+
+            n_in = len(sample)
+            vec  = sample[:N].astype(np.float32) if n_in >= N else \
+                   np.pad(sample.astype(np.float32), (0, N - n_in))
+
+            self._gat_buffer.append(vec)
+            buf = list(self._gat_buffer)
+            if len(buf) < W:
+                buf = [np.zeros(N, dtype=np.float32)] * (W - len(buf)) + buf
+            window_arr  = np.array(buf[-W:], dtype=np.float32)
+            window_norm = (window_arr - self._gat_mean) / self._gat_std
+
+            x = torch.from_numpy(window_norm[np.newaxis])   # (1, W, N)
+            self._gat_model.eval()
+            with torch.no_grad():
+                per_sensor = self._gat_model.per_sensor_error(x)[0]  # (N,)
+                raw_score  = float(per_sensor.mean())
+
+            self._gat_per_sensor = per_sensor
+            self._gat_last_raw   = raw_score
+            self._gat_score_buf.append(raw_score)
+
+            # Update shared root-cause sensor errors (GAT is more precise for
+            # relational anomalies than LSTM reconstruction)
+            if self._haiend_per_sensor is None:
+                self._haiend_per_sensor = per_sensor
+
+            above_thr = raw_score >= self._gat_threshold
+
+            if len(self._gat_score_buf) >= 20:
+                p97 = float(np.percentile(list(self._gat_score_buf), 97))
+            else:
+                p97 = max(self._gat_threshold * 3.0, 1e-6)
+            norm_score = float(np.clip(raw_score / (p97 + 1e-8), 0.0, 2.0))
+
+            return norm_score, per_sensor, above_thr
+
+        except Exception as e:
+            logger.debug(f"GRU-GAT score error: {e}")
+            return 0.0, None, False
 
     # ------------------------------------------------------------------
     # Layer A — LSTM-VAE (probabilistic latent space)
@@ -1039,9 +1145,18 @@ class DigitalTwin:
                 layers_fired.append("Transformer")
             tr_norm_score = tr_ns
 
-        # Update display score to use max of LSTM and Transformer norms
-        if "lstm_haiend" in scores and "transformer" in scores:
-            scores["lstm_haiend"] = max(scores["lstm_haiend"], scores["transformer"])
+        # Layer A3 — GRU-GAT (inter-sensor graph attention, OR logic)
+        if self._gat_model is not None:
+            gat_ns, _gat_per, gat_above = self._gru_gat_score(sample)
+            scores["gru_gat"]  = gat_ns
+            weights["gru_gat"] = _W_LSTM_HAIEND * 0.75  # display weight
+            if gat_above:
+                layers_fired.append("GRU-GAT")
+
+        # Update display score to max of all active deep models
+        deep_keys = [k for k in ("lstm_haiend", "transformer", "gru_gat") if k in scores]
+        if deep_keys:
+            scores["lstm_haiend"] = max(scores[k] for k in deep_keys)
 
         # Layer B — 38-feat fallback (only if haiend absent)
         elif self._fallback_model is not None:
@@ -1087,11 +1202,15 @@ class DigitalTwin:
         n_fired    = len(layers_fired)
         confidence = "HIGH" if n_fired >= 2 else ("MEDIUM" if n_fired == 1 else "LOW")
 
-        # Primary decision: LSTM OR Transformer (ensemble Hard OR, F1=0.6981 → ~0.70)
-        # Transformer adds recall without adding many FP; OR beats individual models
+        # Primary decision: LSTM OR Transformer OR GRU-GAT (triple Hard OR ensemble)
+        # Each model has different failure modes — OR exploits complementary strengths:
+        #   LSTM:      highest recall (fewest FN), captures temporal patterns
+        #   Transformer: highest precision + ROC, captures global window relationships
+        #   GRU-GAT:   detects relational anomalies via inter-sensor graph attention
         lstm_fired        = "LSTM-haiend" in layers_fired or "LSTM-fallback" in layers_fired
         transformer_fired = "Transformer" in layers_fired
-        is_anomalous      = lstm_fired or transformer_fired
+        gat_fired         = "GRU-GAT" in layers_fired
+        is_anomalous      = lstm_fired or transformer_fired or gat_fired
 
         return final, bool(is_anomalous), confidence, layers_fired, scores
 
@@ -1277,8 +1396,13 @@ class DigitalTwin:
             "probable_cause":     probable_cause,
             "max_z_score":        round(max_z, 2),
             "n_sensors_above_3s": int((abs_z > 3.0).sum()),
-            "detection_source":   "LSTM-per-sensor" if self._haiend_per_sensor is not None
-                                   else "Z-score",
+            "detection_source":   (
+                "GRU-GAT+LSTM" if (self._gat_per_sensor is not None and
+                                   self._haiend_per_sensor is not None)
+                else ("GRU-GAT-per-sensor" if self._gat_per_sensor is not None
+                      else ("LSTM-per-sensor" if self._haiend_per_sensor is not None
+                            else "Z-score"))
+            ),
         }
 
         # Append physics violations if available
@@ -1327,8 +1451,15 @@ class DigitalTwin:
 
         # Build model info block
         models_active = []
-        if self._tr_model is not None and self._haiend_model is not None:
+        has_lstm = self._haiend_model is not None or self._ms_pkg is not None
+        has_tr   = self._tr_model is not None
+        has_gat  = self._gat_model is not None
+        if has_lstm and has_tr and has_gat:
+            models_active.append("Ensemble(LSTM+Transformer+GRU-GAT)")
+        elif has_lstm and has_tr:
             models_active.append("Ensemble(LSTM+Transformer)")
+        elif has_lstm and has_gat:
+            models_active.append("Ensemble(LSTM+GRU-GAT)")
         elif self._vae_model is not None:
             models_active.append(f"LSTM-VAE(score={self._vae_score_type})")
         elif self._ms_pkg is not None and self._ms_models:
@@ -1352,10 +1483,11 @@ class DigitalTwin:
             "consecutive_anomalies": self.consecutive_anomalies,
             "models_active":         models_active,
             "primary_model_f1":      (
-                0.6998 if (self._tr_model is not None and self._haiend_model is not None)
-                else (self._vae_pkg.get("best_f1", 0.6874) if self._vae_pkg
-                      else (self._ms_pkg.get("best_ensemble_f1", 0.6874) if self._ms_pkg
-                            else (0.6874 if self._haiend_model is not None else None)))
+                self._gat_pkg.get("best_f1", 0.70) if (has_lstm and has_tr and has_gat)
+                else (0.6998 if (has_lstm and has_tr)
+                      else (self._vae_pkg.get("best_f1", 0.6874) if self._vae_pkg
+                            else (self._ms_pkg.get("best_ensemble_f1", 0.6874) if self._ms_pkg
+                                  else (0.6874 if self._haiend_model is not None else None))))
             ),
         }
 

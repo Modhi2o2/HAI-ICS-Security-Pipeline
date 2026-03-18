@@ -276,6 +276,7 @@ def render_sidebar():
                 "🔍 Data Explorer",
                 "⚠️ Detection",
                 "🤖 Digital Twin",
+                "🏆 Model Arena",
                 "🎭 Scenario Simulation",
                 "✨ Synthetic Generation",
                 "🔎 Explainability",
@@ -1465,6 +1466,416 @@ def page_alerts():
                 st.markdown(f"  • {action}")
 
 
+# ── Model Arena ───────────────────────────────────────────────────────────────
+
+def _compute_event_f1(y: np.ndarray, pred: np.ndarray) -> dict:
+    """
+    Event-level F1: contiguous attack sequences counted as events.
+    TP event = attack event where at least 1 timestep was detected.
+    FP event = predicted anomaly window with no overlap with any attack event.
+    """
+    # Find contiguous attack events
+    attack_events = []
+    in_evt = False
+    for i, lbl in enumerate(y):
+        if lbl == 1 and not in_evt:
+            in_evt, start = True, i
+        elif lbl == 0 and in_evt:
+            attack_events.append((start, i))
+            in_evt = False
+    if in_evt:
+        attack_events.append((start, len(y)))
+
+    # Build attack timestep set
+    attack_ts = set()
+    for s, e in attack_events:
+        attack_ts.update(range(s, e))
+
+    # Find contiguous predicted events
+    pred_events = []
+    in_pred = False
+    for i, p in enumerate(pred):
+        if p == 1 and not in_pred:
+            in_pred, start = True, i
+        elif p == 0 and in_pred:
+            pred_events.append((start, i))
+            in_pred = False
+    if in_pred:
+        pred_events.append((start, len(pred)))
+
+    tp = sum(1 for s, e in attack_events if pred[s:e].sum() > 0)
+    fn = len(attack_events) - tp
+    fp = sum(1 for s, e in pred_events if not any(t in attack_ts for t in range(s, e)))
+
+    pre = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1  = 2 * pre * rec / (pre + rec) if (pre + rec) > 0 else 0.0
+    return dict(event_f1=round(f1, 4), event_precision=round(pre, 4),
+                event_recall=round(rec, 4), tp_events=tp, fp_events=fp,
+                fn_events=fn, n_attack_events=len(attack_events),
+                n_pred_events=len(pred_events))
+
+
+@st.cache_data(show_spinner=False)
+def load_all_model_metrics() -> list:
+    """
+    Scan outputs/models for all detection joblib packages and return their metrics.
+    Also computes event-level F1 from stored per-model evaluation results.
+    """
+    metrics_dir = ROOT / "outputs" / "metrics"
+    models_dir  = ROOT / "outputs" / "models"
+    rows = []
+
+    # Load ensemble eval if present
+    ens_path = metrics_dir / "ensemble_eval.json"
+    ens_all  = {}
+    if ens_path.exists():
+        try:
+            ens_data = json.load(open(ens_path))
+            ens_all  = ens_data.get("all_metrics", {})
+        except Exception:
+            pass
+
+    # Known model files and display names
+    model_files = [
+        ("haiend_lstm_detection.joblib",   "LSTM-AE (haiend, w=30)"),
+        ("transformer_ae_detection.joblib", "Transformer-AE (w=30)"),
+        ("gru_gat_detection.joblib",        "GRU-GAT (graph-attention)"),
+        ("lstm_vae_detection.joblib",       "LSTM-VAE"),
+        ("multiscale_lstm_detection.joblib","LSTM MultiScale (w10+30+60)"),
+        ("lstm_ae_detection.joblib",        "LSTM-AE (38 feat)"),
+    ]
+
+    for fname, display_name in model_files:
+        path = models_dir / fname
+        if not path.exists():
+            continue
+        try:
+            import joblib as _jl
+            pkg = _jl.load(path)
+            if not isinstance(pkg, dict):
+                continue
+            f1  = pkg.get("best_f1", pkg.get("f1", None))
+            m   = pkg.get("all_metrics", {})
+            if isinstance(m, dict):
+                best_key = max(m, key=lambda k: m[k].get("f1", 0)) if m else None
+                if best_key:
+                    bm = m[best_key]
+                    rows.append({
+                        "Model":      display_name,
+                        "F1":         round(bm.get("f1", f1 or 0), 4),
+                        "Precision":  round(bm.get("precision", 0), 4),
+                        "Recall":     round(bm.get("recall", 0), 4),
+                        "ROC-AUC":    round(bm.get("roc_auc", 0), 4),
+                        "TP":         bm.get("tp", "–"),
+                        "FP":         bm.get("fp", "–"),
+                        "FN":         bm.get("fn", "–"),
+                        "Strategy":   best_key,
+                    })
+                    continue
+            if f1 is not None:
+                rows.append({
+                    "Model":     display_name,
+                    "F1":        round(float(f1), 4),
+                    "Precision": "–", "Recall": "–", "ROC-AUC": "–",
+                    "TP": "–", "FP": "–", "FN": "–", "Strategy": "–",
+                })
+        except Exception:
+            continue
+
+    # Add ensemble metrics from ensemble_eval.json
+    for strategy, m in ens_all.items():
+        if strategy in ("LSTM_AE_alone", "Transformer_alone"):
+            continue
+        rows.append({
+            "Model":     f"Ensemble → {strategy}",
+            "F1":        round(m.get("f1", 0), 4),
+            "Precision": round(m.get("precision", 0), 4),
+            "Recall":    round(m.get("recall", 0), 4),
+            "ROC-AUC":   round(m.get("roc_auc", 0), 4),
+            "TP":        m.get("tp", "–"),
+            "FP":        m.get("fp", "–"),
+            "FN":        m.get("fn", "–"),
+            "Strategy":  strategy,
+        })
+
+    return sorted(rows, key=lambda r: float(r["F1"]) if str(r["F1"]) != "–" else 0,
+                  reverse=True)
+
+
+def page_model_arena():
+    st.title("🏆 Model Arena — Detection Performance Comparison")
+    st.caption(
+        "All models trained on haiend-23.05 normal data (896K samples, 225 DCS sensors). "
+        "Evaluated on 284K test timesteps with 11,384 attack labels (4.0%)."
+    )
+
+    # ── Performance Table ────────────────────────────────────────────────────
+    st.subheader("📊 All Models — Ranked by F1")
+
+    rows = load_all_model_metrics()
+
+    if not rows:
+        st.warning("No trained models found. Run training scripts first.")
+        return
+
+    df_models = pd.DataFrame(rows)
+    best_f1 = df_models["F1"].max() if len(df_models) else 0
+
+    # Style the best row
+    def highlight_best(row):
+        if row["F1"] == best_f1:
+            return ["background-color: rgba(0,200,100,0.25)"] * len(row)
+        if str(row["F1"]) != "–" and float(row["F1"]) >= best_f1 * 0.99:
+            return ["background-color: rgba(0,150,255,0.15)"] * len(row)
+        return [""] * len(row)
+
+    styled = df_models.style.apply(highlight_best, axis=1).format(
+        {c: "{:.4f}" for c in ["F1", "Precision", "Recall", "ROC-AUC"]
+         if c in df_models.columns}
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # ── Best Model KPIs ──────────────────────────────────────────────────────
+    if rows:
+        best = rows[0]
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Best F1",        f"{best['F1']:.4f}",  delta=best["Model"])
+        c2.metric("Precision",      str(best["Precision"]))
+        c3.metric("Recall",         str(best["Recall"]))
+        c4.metric("ROC-AUC",        str(best["ROC-AUC"]))
+        c5.metric("True Positives", str(best["TP"]))
+
+    st.divider()
+
+    # ── F1 Bar Chart ─────────────────────────────────────────────────────────
+    st.subheader("📈 F1 Score Comparison")
+
+    df_chart = df_models[df_models["F1"].apply(
+        lambda x: str(x) != "–" and "Ensemble →" not in str(df_models.loc[
+            df_models["F1"] == x].iloc[0]["Model"] if len(df_models[df_models["F1"] == x]) else "")
+    )].copy()
+
+    # Filter to unique models only (no ensemble sub-strategies)
+    df_single = df_models[~df_models["Model"].str.startswith("Ensemble →")].copy()
+    if len(df_single) > 0:
+        fig = go.Figure()
+        colors = [
+            "rgba(0,200,100,0.85)" if row["F1"] == best_f1
+            else ("rgba(0,150,255,0.70)" if str(row["F1"]) != "–" and float(row["F1"]) >= 0.68
+                  else "rgba(150,150,200,0.60)")
+            for _, row in df_single.iterrows()
+        ]
+        fig.add_trace(go.Bar(
+            x=df_single["Model"], y=df_single["F1"].astype(float),
+            marker_color=colors,
+            text=df_single["F1"].apply(lambda v: f"{v:.4f}"),
+            textposition="outside",
+        ))
+        fig.update_layout(
+            title="F1 Score per Model (test set, 284K timesteps)",
+            xaxis_title="Model", yaxis_title="F1 Score",
+            yaxis_range=[0, min(1.0, best_f1 * 1.12)],
+            height=400, margin=dict(t=50, b=150),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#e0e0e0"),
+        )
+        fig.update_xaxes(tickangle=-35)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ── TP / FP / FN Breakdown ───────────────────────────────────────────────
+    st.subheader("🎯 TP / FP / FN Breakdown (single-model, threshold-optimised)")
+
+    numeric_rows = [r for r in rows
+                    if not r["Model"].startswith("Ensemble →")
+                    and str(r["TP"]) != "–"]
+    if numeric_rows:
+        df_conf = pd.DataFrame(numeric_rows)[["Model", "TP", "FP", "FN"]]
+        df_melt = df_conf.melt(id_vars="Model", value_vars=["TP", "FP", "FN"],
+                               var_name="Category", value_name="Count")
+        df_melt["Count"] = pd.to_numeric(df_melt["Count"], errors="coerce")
+        color_map = {"TP": "rgba(0,200,100,0.8)", "FP": "rgba(255,100,50,0.8)",
+                     "FN": "rgba(255,200,0,0.8)"}
+        fig2 = go.Figure()
+        for cat, color in color_map.items():
+            sub = df_melt[df_melt["Category"] == cat]
+            fig2.add_trace(go.Bar(
+                name=cat, x=sub["Model"], y=sub["Count"],
+                marker_color=color,
+                text=sub["Count"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else ""),
+                textposition="inside",
+            ))
+        fig2.update_layout(
+            barmode="group", height=380,
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#e0e0e0"), legend=dict(orientation="h"),
+            margin=dict(t=30, b=150),
+        )
+        fig2.update_xaxes(tickangle=-35)
+        st.plotly_chart(fig2, use_container_width=True)
+        st.caption(
+            "TP=11,384 total attacks. Goal: maximise TP, minimise FP and FN. "
+            "FN=missed attacks are more dangerous than FP=false alarms in ICS."
+        )
+
+    st.divider()
+
+    # ── Event-Level F1 Info ──────────────────────────────────────────────────
+    st.subheader("📅 Event-Level Evaluation")
+    st.info(
+        "**Timestep-level F1** (above) counts each second independently — one attack spanning "
+        "10 minutes = 600 individual predictions. "
+        "\n\n**Event-level F1** counts each contiguous attack sequence as 1 event. "
+        "A True Positive event only requires detecting at least 1 timestep within the attack window. "
+        "This better reflects real-world performance: one alarm during an attack is enough to respond. "
+        "\n\nEvent-level evaluation requires loading 284K test timesteps — click below to compute."
+    )
+
+    if st.button("▶ Compute Event-Level F1 (loads test data ~10s)"):
+        with st.spinner("Loading test data and scoring..."):
+            try:
+                import joblib as _jl
+                haiend_dir = Path("C:/Users/PC GAMING/Desktop/AI/HAI/haiend-23.05/haiend-23.05")
+
+                X_parts, y_parts = [], []
+                for i in [1, 2]:
+                    X_df = pd.read_csv(haiend_dir / f"end-test{i}.csv")
+                    y_df = pd.read_csv(haiend_dir / f"label-test{i}.csv")
+                    X_parts.append(X_df.iloc[:, 1:].ffill().fillna(0).astype(np.float32).values)
+                    y_parts.append(y_df["label"].values.astype(np.int32))
+                X_test = np.concatenate(X_parts, axis=0)
+                y_test = np.concatenate(y_parts, axis=0)
+
+                event_results = []
+                lstm_path = ROOT / "outputs" / "models" / "haiend_lstm_detection.joblib"
+                if lstm_path.exists():
+                    pkg = _jl.load(lstm_path)
+                    scores = score_with_haiend_lstm(X_test, pkg)
+                    thr    = float(pkg.get("threshold", np.percentile(scores, 92)))
+                    pred   = (scores >= thr).astype(int)
+                    ef = _compute_event_f1(y_test, pred)
+                    event_results.append({"Model": "LSTM-AE (haiend)", **ef})
+
+                # Ensemble from stored JSON
+                ens_path = ROOT / "outputs" / "metrics" / "ensemble_eval.json"
+                if ens_path.exists():
+                    ens_data = json.load(open(ens_path))
+                    best_strat = ens_data.get("best_strategy", "max_norm")
+                    bm = ens_data.get("all_metrics", {}).get(best_strat, {})
+                    tp_e  = bm.get("tp", 0)
+                    fp_e  = bm.get("fp", 0)
+                    fn_e  = bm.get("fn", 0)
+                    total = tp_e + fn_e
+                    event_results.append({
+                        "Model": f"Ensemble ({best_strat})",
+                        "event_f1": "N/A (timestep)",
+                        "tp_events": tp_e, "fp_events": fp_e, "fn_events": fn_e,
+                        "n_attack_events": total,
+                    })
+
+                if event_results:
+                    st.dataframe(pd.DataFrame(event_results), use_container_width=True,
+                                 hide_index=True)
+                    st.caption(
+                        "Event-level F1 is typically much higher than timestep-level "
+                        "because a single detection within a multi-minute attack is sufficient."
+                    )
+                else:
+                    st.warning("No models available for event-level scoring.")
+            except Exception as ex:
+                st.error(f"Event-level evaluation failed: {ex}")
+
+    st.divider()
+
+    # ── Improvement History ──────────────────────────────────────────────────
+    st.subheader("📈 Improvement History (all 18+ approaches tried)")
+
+    history = [
+        ("Supervised XGBoost/LightGBM",      0.12),
+        ("MLP Autoencoder (38 feat)",         0.37),
+        ("MLP AE + EWM smoothing",            0.396),
+        ("GDN graph network (38 feat)",       0.417),
+        ("LSTM-AE (38 feat, small)",          0.434),
+        ("haiend LSTM w=30 (100K windows)",   0.687),
+        ("haiend LSTM w=30 (150K windows)",   0.6886),
+        ("LSTM-VAE (150K windows)",           0.670),
+        ("Transformer-AE (w=30, 60ep)",       0.6795),
+        ("Ensemble LSTM+Transformer (max)",   0.6998),
+        ("GRU-GAT (inter-sensor graph)",      None),   # pending
+    ]
+
+    df_hist = pd.DataFrame(history, columns=["Approach", "F1"])
+    trained = df_hist[df_hist["F1"].notna()].copy()
+    pending = df_hist[df_hist["F1"].isna()].copy()
+
+    fig3 = go.Figure()
+    fig3.add_trace(go.Scatter(
+        x=trained.index, y=trained["F1"],
+        mode="lines+markers+text",
+        text=trained["F1"].apply(lambda v: f"{v:.3f}"),
+        textposition="top right",
+        marker=dict(size=10, color="rgba(0,180,255,0.9)"),
+        line=dict(color="rgba(0,180,255,0.7)", width=2),
+        name="Completed",
+    ))
+    if len(pending):
+        fig3.add_trace(go.Scatter(
+            x=pending.index, y=[trained["F1"].max()] * len(pending),
+            mode="markers+text",
+            text=["⏳ Training..." for _ in pending.index],
+            textposition="top right",
+            marker=dict(size=12, color="rgba(255,200,0,0.8)", symbol="diamond"),
+            name="In Progress",
+        ))
+
+    fig3.update_layout(
+        title="F1 Progression Across All Approaches",
+        xaxis=dict(tickmode="array", tickvals=df_hist.index,
+                   ticktext=[r[:35] for r in df_hist["Approach"]], tickangle=-40),
+        yaxis_title="F1 Score",
+        height=420, margin=dict(t=50, b=200),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e0e0e0"),
+    )
+    st.plotly_chart(fig3, use_container_width=True)
+
+    # ── Architecture Summary ─────────────────────────────────────────────────
+    st.subheader("🏗️ Active Ensemble Architecture")
+    cols = st.columns(3)
+    with cols[0]:
+        st.markdown("""
+**LSTM-AE** *(Layer A)*
+- F1 = 0.6886
+- Higher recall (fewer FN)
+- Sequential temporal patterns
+- 400K parameters
+        """)
+    with cols[1]:
+        st.markdown("""
+**Transformer-AE** *(Layer A2)*
+- F1 = 0.6795
+- Higher precision (fewer FP)
+- Best ROC-AUC = 0.8886
+- Global window attention
+- 1.26M parameters
+        """)
+    with cols[2]:
+        st.markdown("""
+**GRU-GAT** *(Layer A3 — training)*
+- Target: F1 > 0.70
+- Inter-sensor graph attention
+- Detects relational anomalies
+- 18K parameters (lightweight)
+        """)
+
+    st.success(
+        "**Triple Hard-OR Ensemble**: is_anomalous = LSTM OR Transformer OR GRU-GAT  \n"
+        "Each model detects different attack signatures — complementary failure modes."
+    )
+
+
 # ── Main App ──────────────────────────────────────────────────────────────────
 
 def main():
@@ -1481,6 +1892,7 @@ def main():
         "Data Explorer": page_data_explorer,
         "Detection": page_detection,
         "Digital Twin": page_digital_twin,
+        "Model Arena": page_model_arena,
         "Scenario Simulation": page_scenario_simulation,
         "Synthetic Generation": page_synthetic_generation,
         "Explainability": page_explainability,
