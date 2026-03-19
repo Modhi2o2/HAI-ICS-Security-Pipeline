@@ -1455,12 +1455,12 @@ class DigitalTwin:
         has_lstm = self._haiend_model is not None or self._ms_pkg is not None
         has_tr   = self._tr_model is not None
         has_gat  = self._gat_model is not None
-        if has_lstm and has_tr and has_gat:
-            models_active.append("Ensemble(LSTM+Transformer+GRU-GAT)")
-        elif has_lstm and has_tr:
-            models_active.append("Ensemble(LSTM+Transformer)")
-        elif has_lstm and has_gat:
-            models_active.append("Ensemble(LSTM+GRU-GAT)")
+        # GRU-GAT is display-only (F1=0.4704 alone; excluded from Hard OR decision)
+        if has_lstm and has_tr:
+            label = "Ensemble(LSTM+Transformer)"
+            if has_gat:
+                label += "+GRU-GAT(display)"
+            models_active.append(label)
         elif self._vae_model is not None:
             models_active.append(f"LSTM-VAE(score={self._vae_score_type})")
         elif self._ms_pkg is not None and self._ms_models:
@@ -1484,11 +1484,10 @@ class DigitalTwin:
             "consecutive_anomalies": self.consecutive_anomalies,
             "models_active":         models_active,
             "primary_model_f1":      (
-                self._gat_pkg.get("best_f1", 0.70) if (has_lstm and has_tr and has_gat)
-                else (0.6998 if (has_lstm and has_tr)
-                      else (self._vae_pkg.get("best_f1", 0.6874) if self._vae_pkg
-                            else (self._ms_pkg.get("best_ensemble_f1", 0.6874) if self._ms_pkg
-                                  else (0.6874 if self._haiend_model is not None else None))))
+                0.6998 if (has_lstm and has_tr)   # ensemble F1 — GRU-GAT not in decision
+                else (self._vae_pkg.get("best_f1", 0.6874) if self._vae_pkg
+                      else (self._ms_pkg.get("best_ensemble_f1", 0.6874) if self._ms_pkg
+                            else (0.6874 if self._haiend_model is not None else None)))
             ),
         }
 
