@@ -1803,7 +1803,7 @@ def page_model_arena():
         ("LSTM-VAE (150K windows)",           0.670),
         ("Transformer-AE (w=30, 60ep)",       0.6795),
         ("Ensemble LSTM+Transformer (max)",   0.6998),
-        ("GRU-GAT (inter-sensor graph)",      None),   # pending
+        ("GRU-GAT (inter-sensor graph, CNN)",  0.4704),  # trained — display only, not in ensemble
     ]
 
     df_hist = pd.DataFrame(history, columns=["Approach", "F1"])
@@ -1863,16 +1863,16 @@ def page_model_arena():
         """)
     with cols[2]:
         st.markdown("""
-**GRU-GAT** *(Layer A3 — training)*
-- Target: F1 > 0.70
-- Inter-sensor graph attention
-- Detects relational anomalies
-- 18K parameters (lightweight)
+**GRU-GAT** *(display / root cause)*
+- F1 = 0.4704 standalone
+- Inter-sensor learned adjacency
+- NOT in Hard OR ensemble (too many FP)
+- Per-sensor errors for root cause analysis
         """)
 
     st.success(
-        "**Triple Hard-OR Ensemble**: is_anomalous = LSTM OR Transformer OR GRU-GAT  \n"
-        "Each model detects different attack signatures — complementary failure modes."
+        "**Active Ensemble (Hard-OR)**: is_anomalous = LSTM OR Transformer → F1=0.6998  \n"
+        "GRU-GAT loaded as display/root-cause layer (standalone F1=0.4704, excluded from decision)."
     )
 
 

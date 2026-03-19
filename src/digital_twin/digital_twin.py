@@ -10,14 +10,14 @@ Detection layers (priority order):
   Layer D   Z-score baseline deviation                      — always available
   Layer E   Isolation Forest                                — unsupervised catch-all
 
-Primary decision (Hard OR triple ensemble):
-  is_anomalous = lstm_fired OR transformer_fired OR gru_gat_fired
+Primary decision (Hard OR dual ensemble — F1=0.6998):
+  is_anomalous = lstm_fired OR transformer_fired
 
 Ensemble rationale:
   LSTM-AE:     highest recall  (fewest FN), captures temporal sequential patterns
   Transformer: highest ROC     (fewer FP),  captures global window relationships
-  GRU-GAT:     inter-sensor    (new axis),  detects relational inconsistencies
-  Combined F1 target: >0.70 (vs 0.6998 for LSTM+Transformer pair)
+  GRU-GAT:     display only    (F1=0.4704 standalone), inter-sensor per-sensor errors
+               → excluded from Hard OR (adds 2108 FP for only ~200 new TP)
 
 Each layer contributes a normalised [0,1] score.
 Display score = max of deep model scores.
@@ -1202,15 +1202,16 @@ class DigitalTwin:
         n_fired    = len(layers_fired)
         confidence = "HIGH" if n_fired >= 2 else ("MEDIUM" if n_fired == 1 else "LOW")
 
-        # Primary decision: LSTM OR Transformer OR GRU-GAT (triple Hard OR ensemble)
-        # Each model has different failure modes — OR exploits complementary strengths:
-        #   LSTM:      highest recall (fewest FN), captures temporal patterns
-        #   Transformer: highest precision + ROC, captures global window relationships
-        #   GRU-GAT:   detects relational anomalies via inter-sensor graph attention
+        # Primary decision: LSTM OR Transformer (Hard OR, F1=0.6998)
+        # GRU-GAT (F1=0.4704 standalone) is EXCLUDED from the Hard OR decision —
+        # its 2108 FPs add more noise than its ~200 unique TPs are worth.
+        # GRU-GAT is used only for per-sensor contribution analysis (root cause).
         lstm_fired        = "LSTM-haiend" in layers_fired or "LSTM-fallback" in layers_fired
         transformer_fired = "Transformer" in layers_fired
-        gat_fired         = "GRU-GAT" in layers_fired
-        is_anomalous      = lstm_fired or transformer_fired or gat_fired
+        gat_fired         = "GRU-GAT" in layers_fired   # tracked for display only
+        is_anomalous      = lstm_fired or transformer_fired
+        # Note: if GRU-GAT improves significantly in future training, re-enable below:
+        # is_anomalous = lstm_fired or transformer_fired or gat_fired
 
         return final, bool(is_anomalous), confidence, layers_fired, scores
 
